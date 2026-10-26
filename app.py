@@ -373,11 +373,11 @@ class Editor(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea,self.preview_dock)
         self.splitDockWidget(self.preview_dock,self.props_dock,Qt.Vertical)
         self.addDockWidget(Qt.BottomDockWidgetArea,self.timeline_dock)
+        self.showNormal()
         screen=QApplication.primaryScreen().availableGeometry()
         width=max(320,min(1280,screen.width()-40))
         height=max(360,min(850,screen.height()-80))
         self.setGeometry(screen.x()+(screen.width()-width)//2,screen.y()+(screen.height()-height)//2,width,height)
-        self.showNormal()
 
     def reset_window_layout(self):
         self.config.remove('geometry')
