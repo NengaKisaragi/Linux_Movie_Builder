@@ -35,8 +35,10 @@ python3 -m venv .venv
 
 ## 起動
 
+GitHubからZIPを取得した場合も、次のコマンドで起動できます。
+
 ```bash
-./start.sh
+bash ./start.sh
 ```
 
 `start.sh` は `.venv` があればそのPythonで、なければシステムの `python3` で起動します。
