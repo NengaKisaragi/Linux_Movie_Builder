@@ -8,6 +8,7 @@ import os
 import subprocess
 import tempfile
 import uuid
+from functools import lru_cache
 from PIL import Image, ImageDraw, ImageFont
 
 BASE_W, BASE_H = 1280, 720
@@ -35,12 +36,19 @@ class Clip:
     height: int = 720
     text: str = ''
     font_size: int = 64
+    font_family: str = '既定'
     color: str = '#ffffff'
+    outline_color: str = '#161c26'
+    outline_width: int = 2
+    shadow_color: str = '#000000'
+    shadow_size: int = 0
+    shadow_blur: int = 0
     opacity: float = 1.0
     rotation: float = 0.0
     animation: dict = field(default_factory=dict)
     keyframes: list = field(default_factory=list)
     filter_type: str = ''
+    filter_strength: int = 24
 
     def __post_init__(self):
         if not self.uid:
@@ -80,16 +88,51 @@ def active_visuals(clips, position):
     return sorted((c for c in clips if c.kind not in ('audio','filter') and c.offset <= position < c.offset+c.duration), key=lambda c: (c.layer, clips.index(c)))
 
 
+@lru_cache(maxsize=1)
+def font_families():
+    try:
+        result=subprocess.run(['fc-list','--format','%{family}\n'],capture_output=True,text=True,timeout=3,check=True)
+        names={name.strip() for line in result.stdout.splitlines() for name in line.split(',') if name.strip()}
+        return ('既定',*sorted(names,key=str.casefold))
+    except (OSError,subprocess.SubprocessError):
+        return ('既定',)
+
+
+@lru_cache(maxsize=128)
+def font_path_for_family(family):
+    if family=='既定' or not family:return FONT
+    try:
+        result=subprocess.run(['fc-match','--format','%{file}',family],capture_output=True,text=True,timeout=3,check=True)
+        path=result.stdout.strip()
+        return path if path and Path(path).is_file() else FONT
+    except (OSError,subprocess.SubprocessError):
+        return FONT
+
+
 def text_image(clip, directory):
     """Same RGBA text raster for the editor, playback and export."""
-    key = hashlib.sha256(json.dumps([clip.text, clip.font_size, clip.color, FONT], ensure_ascii=False).encode()).hexdigest()
+    font_path=font_path_for_family(clip.font_family)
+    outline_width=max(0,int(clip.outline_width))
+    shadow_size=max(0,int(clip.shadow_size))
+    shadow_blur=max(0,int(clip.shadow_blur))
+    key = hashlib.sha256(json.dumps([clip.text, clip.font_size, clip.font_family, font_path, clip.color, clip.outline_color, outline_width, clip.shadow_color, shadow_size, shadow_blur], ensure_ascii=False).encode()).hexdigest()
     path = Path(directory)/f'text-{key}.png'
     if not path.is_file():
-        font = ImageFont.truetype(FONT, clip.font_size)
+        font = ImageFont.truetype(font_path, clip.font_size)
         measure = ImageDraw.Draw(Image.new('RGBA', (1, 1)))
-        left, top, right, bottom = measure.multiline_textbbox((0, 0), clip.text or ' ', font=font, spacing=8, stroke_width=2)
-        image = Image.new('RGBA', (min(8192, max(8, right-left+12)), min(4096, max(8, bottom-top+12))), (0, 0, 0, 0))
-        ImageDraw.Draw(image).multiline_text((6-left, 6-top), clip.text or ' ', font=font, fill=clip.color, spacing=8, stroke_width=2, stroke_fill='#161c26')
+        left, top, right, bottom = measure.multiline_textbbox((0, 0), clip.text or ' ', font=font, spacing=8, stroke_width=outline_width)
+        margin=8+outline_width+shadow_size+shadow_blur*2
+        image = Image.new('RGBA', (min(8192, max(8, right-left+margin*2+shadow_size)), min(4096, max(8, bottom-top+margin*2+shadow_size))), (0, 0, 0, 0))
+        position=(margin-left,margin-top)
+        if shadow_size or shadow_blur:
+            shadow=Image.new('RGBA',image.size,(0,0,0,0))
+            shadow_pos=(position[0]+max(1,shadow_size//2),position[1]+max(1,shadow_size//2))
+            ImageDraw.Draw(shadow).multiline_text(shadow_pos,clip.text or ' ',font=font,spacing=8,fill=clip.shadow_color,stroke_width=shadow_size,stroke_fill=clip.shadow_color)
+            if shadow_blur:
+                from PIL import ImageFilter
+                shadow=shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
+            image.alpha_composite(shadow)
+        ImageDraw.Draw(image).multiline_text(position, clip.text or ' ', font=font, fill=clip.color, spacing=8, stroke_width=outline_width, stroke_fill=clip.outline_color)
         image.save(path)
     return str(path)
 
@@ -120,7 +163,9 @@ def validate(clips):
             raise ValueError(f'素材が見つかりません: {c.path}')
         if c.kind=='filter' and c.filter_type not in ('scenechange','fade','mosaic','blur'):
             raise ValueError('フィルタの種類が無効です')
-        for n in (c.source_duration, c.start, c.duration, c.offset, c.volume, c.x, c.y, c.scale, c.opacity, c.rotation, c.width, c.height, c.font_size):
+        if c.kind=='filter' and not 1<=c.filter_strength<=100:
+            raise ValueError('フィルタの強さは1〜100で指定してください')
+        for n in (c.source_duration, c.start, c.duration, c.offset, c.volume, c.x, c.y, c.scale, c.opacity, c.rotation, c.width, c.height, c.font_size, c.filter_strength):
             if not isinstance(n, (float, int)) or not math.isfinite(n):
                 raise ValueError('数値が無効です')
         if c.duration < .04 or c.start < 0 or c.offset < 0 or not 0 <= c.volume <= 2:
@@ -150,6 +195,10 @@ def validate(clips):
                 raise ValueError('テキストの長さまたは文字サイズが無効です')
             from PIL import ImageColor
             ImageColor.getrgb(c.color)
+            ImageColor.getrgb(c.outline_color)
+            ImageColor.getrgb(c.shadow_color)
+            if not isinstance(c.font_family,str) or len(c.font_family)>128 or not 0<=c.outline_width<=40 or not 0<=c.shadow_size<=40 or not 0<=c.shadow_blur<=40:
+                raise ValueError('フォントまたは文字装飾の設定が無効です')
         if c.uid in ids:
             raise ValueError('クリップIDが重複しています')
         ids.add(c.uid)
@@ -268,7 +317,7 @@ def _expr(clip, key, base, time='t'):
     return result
 
 
-def composition(clips, resolution, fps, directory, position=0, realtime=False, video=True, audio=True):
+def composition(clips, resolution, fps, directory, position=0, realtime=False, video=True, audio=True, hardware_decode=False):
     """One composition graph used by export and streaming, seeking inputs directly."""
     validate(clips)
     if not clips:
@@ -297,65 +346,75 @@ def composition(clips, resolution, fps, directory, position=0, realtime=False, v
         filters.append(f'[{index}:a]anull[silence]')
         audio_tracks.append('[silence]')
     visual_index = 0
-    global_filters=sorted((c for c in clips if c.kind=='filter'),key=lambda c:(c.offset,clips.index(c)))
-    for c in sorted((c for c in clips if c.kind!='filter'), key=lambda c: (c.layer, clips.index(c))):
-        skip, remaining, delay = _remaining(c, position)
-        use_video = video and c.kind != 'audio'
-        use_audio = audio and c.has_audio
-        if remaining <= 0 or not (use_video or use_audio):
-            continue
-        i = next_input
-        next_input += 1
-        path = text_image(c, directory) if c.kind == 'text' else c.path
-        if c.kind in ('image', 'text'):
-            args += ['-loop', '1', '-framerate', str(fps)]
-        else:
-            args += ['-ss', f'{c.start+skip:.6f}']
-        args += ['-threads', '2', '-t', f'{remaining:.6f}', '-i', path]
-        if use_video:
-            w, h = placed_size(c, directory)
-            w, h = max(2, round(w/c.scale*width/BASE_W)), max(2, round(h/c.scale*height/BASE_H))
-            sx = _expr(c, 'scale', c.scale, time=f't+{position:.9g}')
-            xx = _expr(c, 'x', c.x, time=f't+{position:.9g}')
-            yy = _expr(c, 'y', c.y, time=f't+{position:.9g}')
-            angle = _expr(c, 'rotation', c.rotation, time=f't+{position:.9g}')
-            alpha = _expr(c, 'opacity', c.opacity, time=f't+{position:.9g}')
-            chain=[f'fps={fps}',f'trim=duration={remaining:.6f}',f'setpts=PTS-STARTPTS+{delay:.6f}/TB',f"scale=w='max(2,trunc({w}*({sx})/2)*2)':h='max(2,trunc({h}*({sx})/2)*2)':eval=frame",'setsar=1','format=rgba']
-            if c.rotation!=0 or c.animation.get('rotation',{}).get('mode','none')!='none':
-                chain.append(f"rotate=a='({angle})*PI/180':ow='rotw(iw)':oh='roth(ih)':c=none")
-            if c.opacity!=1 or c.animation.get('opacity',{}).get('mode','none')!='none':
-                chain.append(f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({alpha})'")
-            filters.append(f"[{i}:v]"+','.join(chain)+f'[layer{visual_index}]')
-            x = f"(({xx})*main_w/{BASE_W}-overlay_w/2)"
-            y = f"(({yy})*main_h/{BASE_H}-overlay_h/2)"
-            filters.append(f"[base{visual_index}][layer{visual_index}]overlay=x='{x}':y='{y}':eof_action=pass:repeatlast=0:enable='between(t\\,{delay:.6f}\\,{delay+remaining:.6f})'[base{visual_index+1}]")
-            visual_index += 1
-        if use_audio:
-            millis = round(delay*1000)
-            label = f'a{i}'
-            vol = _expr(c, 'volume', c.volume, time=f't+{position:.9g}')
-            filters.append(f"[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={remaining:.6f},asetpts=PTS-STARTPTS+{delay:.6f}/TB,volume=volume='{vol}':eval=frame,adelay={millis}|{millis}[{label}]")
-            audio_tracks.append(f'[{label}]')
-    if video:
-        current=f'base{visual_index}'
-        filter_no=0
-        for clip in global_filters:
+    current_video=f'base{visual_index}'
+    filter_no=0
+    clips_by_layer={}
+    for clip in sorted((c for c in clips if c.kind!='filter'),key=lambda c:(c.layer,clips.index(c))):
+        clips_by_layer.setdefault(clip.layer,[]).append(clip)
+    filters_by_layer={}
+    for clip in sorted((c for c in clips if c.kind=='filter'),key=lambda c:(c.layer,c.offset,clips.index(c))):
+        filters_by_layer.setdefault(clip.layer,[]).append(clip)
+    for layer in sorted(set(clips_by_layer)|set(filters_by_layer)):
+        for clip in filters_by_layer.get(layer,[]):
             start=max(0.0,clip.offset-position)
             end=min(duration,clip.offset+clip.duration-position)
             if end<=start:continue
             enable=f"between(t\\,{start:.6f}\\,{end:.6f})"
-            if clip.filter_type=='blur':chain=f"boxblur=20:enable='{enable}'"
-            elif clip.filter_type=='mosaic':chain=f"pixelize=width=24:height=24:enable='{enable}'"
+            if clip.filter_type=='blur':chain=f"boxblur={clip.filter_strength}:enable='{enable}'"
+            elif clip.filter_type=='mosaic':chain=f"pixelize=width={clip.filter_strength}:height={clip.filter_strength}:enable='{enable}'"
             elif clip.filter_type=='fade':
-                half=min(.25,(end-start)/2)
+                half=min(clip.filter_strength/100,(end-start)/2)
                 chain=f"fade=t=in:st={start:.6f}:d={half:.6f},fade=t=out:st={end-half:.6f}:d={half:.6f}"
             else:
-                half=min(.3,(end-start)/2)
+                half=min(clip.filter_strength/100,(end-start)/2)
                 chain=f"fade=t=out:st={start:.6f}:d={half:.6f},fade=t=in:st={end-half:.6f}:d={half:.6f}"
-            label=f'global{filter_no}'
-            filters.append(f'[{current}]{chain}[{label}]')
-            current=label;filter_no+=1
-        filters.append(f'[{current}]trim=duration={duration:.6f},format=rgb24[video]')
+            label=f'layerfilter{filter_no}'
+            filters.append(f'[{current_video}]{chain}[{label}]')
+            current_video=label
+            filter_no+=1
+        for c in clips_by_layer.get(layer,[]):
+            skip, remaining, delay = _remaining(c, position)
+            use_video = video and c.kind != 'audio'
+            use_audio = audio and c.has_audio
+            if remaining <= 0 or not (use_video or use_audio):
+                continue
+            i = next_input
+            next_input += 1
+            path = text_image(c, directory) if c.kind == 'text' else c.path
+            if c.kind in ('image', 'text'):
+                args += ['-loop', '1', '-framerate', str(fps)]
+            else:
+                if hardware_decode and realtime and use_video and c.kind == 'video':
+                    args += ['-hwaccel', 'auto']
+                args += ['-ss', f'{c.start+skip:.6f}']
+            args += ['-threads', '2', '-t', f'{remaining:.6f}', '-i', path]
+            if use_video:
+                w, h = placed_size(c, directory)
+                w, h = max(2, round(w/c.scale*width/BASE_W)), max(2, round(h/c.scale*height/BASE_H))
+                sx = _expr(c, 'scale', c.scale, time=f't+{position:.9g}')
+                xx = _expr(c, 'x', c.x, time=f't+{position:.9g}')
+                yy = _expr(c, 'y', c.y, time=f't+{position:.9g}')
+                angle = _expr(c, 'rotation', c.rotation, time=f't+{position:.9g}')
+                alpha = _expr(c, 'opacity', c.opacity, time=f't+{position:.9g}')
+                chain=[f'fps={fps}',f'trim=duration={remaining:.6f}',f'setpts=PTS-STARTPTS+{delay:.6f}/TB',f"scale=w='max(2,trunc({w}*({sx})/2)*2)':h='max(2,trunc({h}*({sx})/2)*2)':eval=frame",'setsar=1','format=rgba']
+                if c.rotation!=0 or c.animation.get('rotation',{}).get('mode','none')!='none':
+                    chain.append(f"rotate=a='({angle})*PI/180':ow='rotw(iw)':oh='roth(ih)':c=none")
+                if c.opacity!=1 or c.animation.get('opacity',{}).get('mode','none')!='none':
+                    chain.append(f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({alpha})'")
+                filters.append(f"[{i}:v]"+','.join(chain)+f'[layer{visual_index}]')
+                x = f"(({xx})*main_w/{BASE_W}-overlay_w/2)"
+                y = f"(({yy})*main_h/{BASE_H}-overlay_h/2)"
+                filters.append(f"[{current_video}][layer{visual_index}]overlay=x='{x}':y='{y}':eof_action=pass:repeatlast=0:enable='between(t\\,{delay:.6f}\\,{delay+remaining:.6f})'[base{visual_index+1}]")
+                current_video=f'base{visual_index+1}'
+                visual_index += 1
+            if use_audio:
+                millis = round(delay*1000)
+                label = f'a{i}'
+                vol = _expr(c, 'volume', c.volume, time=f't+{position:.9g}')
+                filters.append(f"[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={remaining:.6f},asetpts=PTS-STARTPTS+{delay:.6f}/TB,volume=volume='{vol}':eval=frame,adelay={millis}|{millis}[{label}]")
+                audio_tracks.append(f'[{label}]')
+    if video:
+        filters.append(f'[{current_video}]trim=duration={duration:.6f},format=rgb24[video]')
     if audio:
         filters.append(''.join(audio_tracks)+f'amix=inputs={len(audio_tracks)}:duration=longest:normalize=0,alimiter=limit=0.95:level=0:latency=1,atrim=duration={duration:.6f}[audio]')
     args += ['-filter_complex', ';'.join(filters)]
@@ -369,8 +428,8 @@ def render_command(clips, output, resolution='1920x1080', fps=60, preview=False,
     return args
 
 
-def video_stream_command(clips, position, directory):
-    args, duration = composition(clips, '800x450', 30, directory, position, True, video=True, audio=False)
+def video_stream_command(clips, position, directory, hardware_decode=False):
+    args, duration = composition(clips, '800x450', 30, directory, position, True, video=True, audio=False, hardware_decode=hardware_decode)
     return args+['-map', '[video]', '-t', f'{duration:.6f}', '-pix_fmt', 'rgb24', '-threads', '1', '-f', 'rawvideo', 'pipe:1']
 
 

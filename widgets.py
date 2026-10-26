@@ -1,8 +1,8 @@
 """Interactive composition canvas and layered timeline."""
 import copy
-from PyQt5.QtCore import Qt, QRectF, QPointF
+from PyQt5.QtCore import Qt, QRectF, QPointF, QPoint, QTimer
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
-from PyQt5.QtWidgets import QWidget, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsItem, QMenu
+from PyQt5.QtWidgets import QApplication, QWidget, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsItem, QMenu
 from core import BASE_W, BASE_H, total_duration, placed_size, active_visuals, text_image, animated_value
 
 
@@ -161,16 +161,23 @@ class Timeline(QWidget):
         self.editor, self.scale = editor, 65
         self.boxes, self.drag = [], None
         self.scrubbing = False
+        self.selected_uids = {editor.selected} if editor.selected else set()
+        self.selection_rect = None
+        self.selection_origin = None
+        self.selection_base = set()
+        self.selection_mode = None
+        self.right_press = None
+        self.resize_lock = False
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setMinimumHeight(290)
 
     def layer_count(self):
-        return max(4, max((c.layer+1 for c in self.editor.clips if c.kind not in ('audio','filter')), default=4))
+        return max(4, max((c.layer+1 for c in self.editor.clips), default=4))
 
     def refresh(self):
         self.setMinimumWidth(max(1100, int(max(30,total_duration(self.editor.clips)+15)*self.scale)+185))
-        self.setMinimumHeight(self.TOP+self.ROW*(1+self.layer_count()+max(1, sum(c.kind == 'audio' for c in self.editor.clips)))+30)
+        self.setMinimumHeight(self.TOP+self.ROW*self.layer_count()+30)
         self.update()
 
     def seek_limit(self):
@@ -183,7 +190,7 @@ class Timeline(QWidget):
         return max(0, round((x-self.LEFT)/self.scale*fps)/fps)
 
     def layer_at(self, y):
-        return max(0, min(15, int((y-self.TOP)/self.ROW)-1))
+        return max(0, min(15, int((y-self.TOP)/self.ROW)))
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -197,24 +204,22 @@ class Timeline(QWidget):
             p.setPen(QColor('#8f9db2'))
             p.drawText(x+3, 22, f'{sec//60:02d}:{sec%60:02d}')
         count = self.layer_count()
-        for row in range(1+count+max(1, sum(c.kind == 'audio' for c in self.editor.clips))):
+        for row in range(count):
             y = self.TOP+row*self.ROW
             p.setPen(QColor('#243044'))
             p.drawLine(0, y, self.width(), y)
             p.setPen(QColor('#94a6be'))
-            label='フィルタ' if row==0 else f'Layer {row}' if row<=count else f'音声 {row-count}'
+            label=f'Layer {row+1}'
             p.drawText(10, y+29, label)
         self.boxes = []
-        audio_row = count+1
         for c in sorted(self.editor.clips, key=lambda c: (c.layer, self.editor.clips.index(c))):
-            row = 0 if c.kind=='filter' else audio_row if c.kind == 'audio' else c.layer+1
-            if c.kind == 'audio':
-                audio_row += 1
+            row = c.layer
             rect = QRectF(self.LEFT+c.offset*self.scale, self.TOP+row*self.ROW+5, max(5, c.duration*self.scale), self.ROW-10)
             p.setBrush(QColor({'audio':'#246c65','text':'#6f4f8b','image':'#795e36','video':'#294d7c','filter':'#8b4f5b'}[c.kind]))
-            p.setPen(QPen(QColor('#a0caff' if c.uid == self.editor.selected else '#47658b'), 2 if c.uid == self.editor.selected else 1))
+            selected=c.uid in self.selected_uids
+            p.setPen(QPen(QColor('#a0caff' if selected else '#47658b'), 2 if selected else 1))
             p.drawRoundedRect(rect, 4, 4)
-            if c.uid == self.editor.selected:
+            if selected:
                 if c.keyframes:
                     segment=max(0,min(int(self.editor.selected_segment),len(c.keyframes)))
                     left_time=0.0 if segment==0 else float(c.keyframes[segment-1]['time'])
@@ -243,106 +248,268 @@ class Timeline(QWidget):
                 continue
             for point in clip.keyframes:
                 x=int(self.LEFT+(clip.offset+point['time'])*self.scale)
+                p.setPen(QPen(QColor('#a9d3ff'),2))
                 p.drawLine(x,rect.top()-3,x,rect.bottom()+3)
                 p.setBrush(QColor('#a9d3ff'))
-                p.drawEllipse(QPointF(x,rect.top()-1),3.5,3.5)
+                p.drawEllipse(QPointF(x,rect.top()-1),4.5,4.5)
+        if self.selection_rect is not None:
+            p.setPen(QPen(QColor(133,190,255,220),1,Qt.DashLine))
+            p.setBrush(QColor(83,145,220,55))
+            p.drawRect(self.selection_rect.normalized())
         x = int(self.LEFT+self.editor.position*self.scale)
         p.setPen(QPen(QColor('#ffbc67'), 2))
         p.drawLine(x, 26, x, self.height())
         p.end()
 
-    def mousePressEvent(self, event):
-        if event.button() != Qt.LeftButton:
-            return
-        self.editor.stop_playback()
-        if event.pos().y() >= self.TOP:
-            for rect, uid in reversed(self.boxes):
-                if rect.contains(event.pos()):
-                    c = self.editor.by_id(uid)
-                    click_position=self.time_at(event.pos().x())
-                    self.editor.select_segment(uid,click_position)
-                    edge = 'left' if event.pos().x()-rect.left() < 6 else 'right' if rect.right()-event.pos().x() < 6 else 'move'
-                    self.drag = {'uid':uid, 'x':event.pos().x(), 'y':event.pos().y(), 'offset':c.offset, 'layer':c.layer, 'start':c.start, 'duration':c.duration, 'keyframes':copy.deepcopy(c.keyframes), 'mode':edge, 'saved':False}
-                    self.editor.seek(click_position)
-                    return
-        self.scrubbing = True
-        self.editor.seek(self.time_at(event.pos().x()))
+    def hit_clip(self, position):
+        for clip in reversed(sorted(self.editor.clips,key=lambda c:(c.layer,self.editor.clips.index(c)))):
+            row=clip.layer
+            rect=QRectF(self.LEFT+clip.offset*self.scale,self.TOP+row*self.ROW+5,max(5,clip.duration*self.scale),self.ROW-10)
+            if rect.adjusted(-1,-1,1,1).contains(position):
+                return rect,clip
+        return None
 
-    def mouseMoveEvent(self, event):
-        if not event.buttons() & Qt.LeftButton:
-            return
-        if self.scrubbing:
-            self.editor.seek(self.time_at(event.pos().x()))
-            return
-        d = self.drag
-        if not d or abs(event.pos().x()-d['x'])+abs(event.pos().y()-d['y']) < 3:
-            return
-        c = self.editor.by_id(d['uid'])
-        if c is None:
-            return
-        if not d['saved']:
-            self.editor.checkpoint()
-            d['saved'] = True
-        delta = round((event.pos().x()-d['x'])/self.scale*self.editor.output_fps)/self.editor.output_fps
-        if d['mode'] == 'move':
-            c.offset = max(0, d['offset']+delta)
-            if c.kind not in ('audio','filter'):
-                c.layer = min(self.layer_at(event.pos().y()), self.layer_count()-1)
-        elif d['mode'] == 'left':
-            lower = max(-d['offset'], -d['start']) if c.kind in ('video','audio') else -d['offset']
-            delta = min(d['duration']-.04, max(lower, delta))
-            c.offset, c.duration = d['offset']+delta, d['duration']-delta
-            c.keyframes=[{'time':float(point['time'])-delta,'values':copy.deepcopy(point.get('values',{}))} for point in d['keyframes'] if float(point['time'])>delta and float(point['time'])-delta<c.duration-.04]
-            if c.kind in ('video','audio'):
-                c.start = d['start']+delta
+    def apply_selection(self, uids, active=None, position=None):
+        chosen=set(uids)
+        if active is not None:
+            if position is None:self.editor.select(active)
+            else:self.editor.select_segment(active,position)
         else:
-            c.duration = max(.04, min(c.source_duration-c.start, d['duration']+delta))
-            c.keyframes=[point for point in d['keyframes'] if float(point['time'])<c.duration-.04]
-        self.editor.dirty = True
-        self.refresh()
-        self.editor.update_properties()
-        self.editor.update_title()
-        self.editor.seek(min(c.offset+min(.03, c.duration/2), total_duration(self.editor.clips)))
+            self.editor.select(None)
+        self.selected_uids=chosen
+        self.update()
 
-    def mouseReleaseEvent(self, event):
-        if self.scrubbing:
-            self.editor.seek(self.time_at(event.pos().x()))
-        moved = self.drag and self.drag['saved']
-        self.scrubbing, self.drag = False, None
-        if moved:
-            self.editor.refresh()
+    def select_in_rectangle(self, additive):
+        rect=self.selection_rect.normalized() if self.selection_rect is not None else QRectF()
+        chosen=set(self.selection_base) if additive else set()
+        chosen.update(uid for box,uid in self.boxes if box.intersects(rect))
+        active=next((uid for box,uid in reversed(self.boxes) if uid in chosen and box.intersects(rect)),next(iter(chosen),None))
+        self.apply_selection(chosen,active,self.editor.position if active else None)
 
-    def contextMenuEvent(self, event):
-        position=self.time_at(event.pos().x())
-        hit=next((self.editor.by_id(uid) for rect,uid in reversed(self.boxes) if rect.contains(event.pos())),None)
+    def show_timeline_menu(self, position, global_position):
+        position_time=self.time_at(position.x())
+        layer=min(15,self.layer_at(position.y()))
+        hit=self.hit_clip(position)
         menu=QMenu(self)
-        if hit and hit.kind=='filter':
-            remove=menu.addAction('フィルタを削除')
-            if menu.exec_(event.globalPos())==remove:self.editor.delete_clip(hit.uid)
-        elif hit:
-            add=menu.addAction('中間点を追加')
-            points=hit.keyframes
-            nearest=min(points,key=lambda p:abs(hit.offset+p['time']-position),default=None)
-            remove=menu.addAction(f'中間点を削除  ({hit.offset+nearest["time"]:.2f} 秒)' if nearest else '中間点を削除')
-            remove.setEnabled(nearest is not None)
+        if hit:
+            clip=hit[1]
+            if clip.kind=='filter':
+                remove=menu.addAction('フィルタを削除')
+            else:
+                add=menu.addAction('中間点を追加')
+                points=clip.keyframes
+                nearest=min(points,key=lambda p:abs(clip.offset+p['time']-position_time),default=None)
+                remove=menu.addAction(f'中間点を削除  ({clip.offset+nearest["time"]:.2f} 秒)' if nearest else '中間点を削除')
+                remove.setEnabled(nearest is not None)
             menu.addSeparator()
-            text_action=menu.addAction('テキストを追加…')
-            chosen=menu.exec_(event.globalPos())
-            if chosen==add:self.editor.add_keyframe(hit.uid,position)
-            elif chosen==remove and nearest:self.editor.remove_keyframe(hit.uid,nearest['time'])
-            elif chosen==text_action:self.editor.add_text(offset=position,layer=min(self.layer_at(event.pos().y()),self.layer_count()-1))
         else:
+            text_action=menu.addAction('テキストを追加')
             media_action=menu.addAction('素材を追加…')
             filter_menu=menu.addMenu('フィルタを追加')
             filter_actions={name:filter_menu.addAction(name) for name in ('シーンチェンジ','フェード','モザイク','ぼかし')}
             filter_types={'シーンチェンジ':'scenechange','フェード':'fade','モザイク':'mosaic','ぼかし':'blur'}
-            text_action=menu.addAction('テキストを追加…')
-            chosen=menu.exec_(event.globalPos())
-            if chosen==media_action:self.editor.import_files(offset=position,layer=min(self.layer_at(event.pos().y()),self.layer_count()-1))
-            elif chosen==text_action:self.editor.add_text(offset=position,layer=min(self.layer_at(event.pos().y()),self.layer_count()-1))
+            menu.addSeparator()
+        selected=set(self.selected_uids)
+        if not selected and self.editor.selected:selected={self.editor.selected}
+        copy_action=menu.addAction('コピー')
+        cut_action=menu.addAction('切り取り')
+        paste_action=menu.addAction('貼り付け')
+        copy_action.setEnabled(bool(selected))
+        cut_action.setEnabled(bool(selected))
+        paste_action.setEnabled(bool(self.editor.timeline_clipboard))
+        chosen=menu.exec_(global_position)
+        if hit:
+            clip=hit[1]
+            if clip.kind=='filter' and chosen==remove:self.editor.delete_clip(clip.uid)
+            elif clip.kind!='filter' and chosen==add:self.editor.add_keyframe(clip.uid,position_time)
+            elif clip.kind!='filter' and chosen==remove and nearest:self.editor.remove_keyframe(clip.uid,nearest['time'])
+        else:
+            if chosen==text_action:self.editor.add_text(offset=position_time,layer=layer)
+            elif chosen==media_action:self.editor.import_files(offset=position_time,layer=layer)
             else:
                 selected_type=next((kind for name,kind in filter_types.items() if chosen==filter_actions[name]),None)
-                if selected_type:self.editor.add_filter(selected_type,position)
+                if selected_type:self.editor.add_filter(selected_type,position_time,layer)
+        if chosen==copy_action:self.editor.copy_timeline_clips(selected)
+        elif chosen==cut_action:self.editor.cut_timeline_clips(selected)
+        elif chosen==paste_action:self.editor.paste_timeline_clips(position_time)
+
+    def mousePressEvent(self, event):
+        if event.button()==Qt.RightButton:
+            self.editor.stop_playback()
+            hit=self.hit_clip(event.pos())
+            self.right_press={'pos':QPoint(event.pos()),'global':QPoint(event.globalPos()),'hit':hit[1].uid if hit else None,'modifiers':event.modifiers(),'moved':False}
+            self.drag=None
+            self.scrubbing=False
+            if hit is None:
+                self.selection_mode='right'
+                self.selection_origin=QPoint(event.pos())
+                self.selection_current=QPoint(event.pos())
+                additive=bool(event.modifiers() & (Qt.ControlModifier|Qt.ShiftModifier))
+                self.selection_base=set(self.selected_uids) if additive else set()
+                self.selection_rect=QRectF(self.selection_origin,self.selection_current)
+            event.accept()
+            return
+        if event.button()!=Qt.LeftButton:return
+        self.editor.stop_playback()
+        self.drag=None
+        self.scrubbing=False
+        self.selection_mode=None
+        self.selection_rect=None
+        hit=self.hit_clip(event.pos()) if event.pos().y()>=self.TOP else None
+        modifiers=event.modifiers()
+        if hit:
+            rect,c=hit
+            click_position=self.time_at(event.pos().x())
+            old_selection=set(self.selected_uids)
+            ctrl=bool(modifiers & Qt.ControlModifier)
+            shift=bool(modifiers & Qt.ShiftModifier)
+            if ctrl:
+                next_selection=set(old_selection)
+                if c.uid in next_selection:next_selection.remove(c.uid)
+                else:next_selection.add(c.uid)
+                active=c.uid if c.uid in next_selection else next(iter(next_selection),None)
+                self.apply_selection(next_selection,active,click_position if active==c.uid else self.editor.position)
+            elif shift:
+                next_selection=old_selection|{c.uid}
+                self.apply_selection(next_selection,c.uid,click_position)
+            elif c.uid in old_selection and len(old_selection)>1:
+                self.editor.select_segment(c.uid,click_position)
+                self.selected_uids=old_selection
+            else:
+                self.apply_selection({c.uid},c.uid,click_position)
+            point_index=min(range(len(c.keyframes)),key=lambda i:abs(self.LEFT+(c.offset+float(c.keyframes[i]['time']))*self.scale-event.pos().x()),default=None)
+            point_x=self.LEFT+(c.offset+float(c.keyframes[point_index]['time']))*self.scale if point_index is not None else None
+            if point_index is not None and abs(point_x-event.pos().x())<=8:mode='keyframe'
+            elif rect.width()<24:mode='move'
+            else:
+                edge_zone=min(8.0,rect.width()/3)
+                mode='left' if event.pos().x()-rect.left()<edge_zone else 'right' if rect.right()-event.pos().x()<edge_zone else 'move'
+            group=[{'uid':clip.uid,'offset':clip.offset,'layer':clip.layer} for clip in self.editor.clips if clip.uid in self.selected_uids] if mode=='move' else None
+            self.drag={'uid':c.uid,'x':event.pos().x(),'y':event.pos().y(),'offset':c.offset,'layer':c.layer,'start':c.start,'duration':c.duration,'keyframes':copy.deepcopy(c.keyframes),'point_index':point_index,'mode':mode,'saved':False,'group':group,'modifiers':modifiers}
+            event.accept()
+            return
+        if self.resize_lock:
+            event.accept()
+            return
+        if modifiers & Qt.ControlModifier:
+            self.selection_mode='left'
+            self.selection_origin=QPoint(event.pos())
+            self.selection_current=QPoint(event.pos())
+            self.selection_base=set(self.selected_uids)
+            self.selection_rect=QRectF(self.selection_origin,self.selection_current)
+            event.accept()
+            return
+        self.scrubbing=True
+        self.editor.seek(self.time_at(event.pos().x()))
+
+    def mouseMoveEvent(self, event):
+        if self.selection_mode:
+            self.selection_current=QPoint(event.pos())
+            self.selection_rect=QRectF(self.selection_origin,self.selection_current).normalized()
+            if self.right_press:self.right_press['moved']=self.selection_rect.width()+self.selection_rect.height()>=5
+            self.update()
+            return
+        dragging=bool((event.buttons()|QApplication.mouseButtons()) & (Qt.LeftButton|Qt.RightButton))
+        if not dragging:
+            hit=next(((rect,self.editor.by_id(uid)) for rect,uid in reversed(self.boxes) if rect.adjusted(-8,0,8,0).contains(event.pos())),None)
+            resize=False
+            move=bool(hit)
+            if hit:
+                rect,clip=hit
+                resize=rect.width()>=24 and (event.pos().x()-rect.left()<min(8.0,rect.width()/3) or rect.right()-event.pos().x()<min(8.0,rect.width()/3))
+                if clip:resize=resize or any(abs(self.LEFT+(clip.offset+float(point['time']))*self.scale-event.pos().x())<=8 for point in clip.keyframes)
+            self.resize_lock=resize
+            self.setCursor(Qt.SizeHorCursor if resize else Qt.SizeAllCursor if move else Qt.ArrowCursor)
+            return
+        if self.scrubbing:
+            self.editor.seek(self.time_at(event.pos().x()))
+            return
+        self.drag_to(event.pos())
+        event.accept()
+
+    def drag_to(self, position):
+        d=self.drag
+        if not d or abs(position.x()-d['x'])+abs(position.y()-d['y'])<3:return
+        c=self.editor.by_id(d['uid'])
+        if c is None:return
+        if not d['saved']:
+            self.editor.checkpoint()
+            d['saved']=True
+        delta=round((position.x()-d['x'])/self.scale*self.editor.output_fps)/self.editor.output_fps
+        if d['mode']=='keyframe':
+            index=d['point_index']
+            if index is not None and index<len(c.keyframes):
+                points=d['keyframes'];frame=1/self.editor.output_fps
+                lower=float(points[index-1]['time'])+frame if index else frame
+                upper=float(points[index+1]['time'])-frame if index+1<len(points) else d['duration']-frame
+                local=max(lower,min(upper,float(points[index]['time'])+delta))
+                c.keyframes[index]['time']=local;c.keyframes.sort(key=lambda point:float(point['time']))
+                self.editor.select_segment(c.uid,c.offset+local)
+        elif d['mode']=='move':
+            group=d['group'] or [{'uid':c.uid,'offset':d['offset'],'layer':d['layer']}]
+            delta=max(-min(item['offset'] for item in group),delta)
+            layer_delta=round((position.y()-d['y'])/self.ROW)
+            layer_delta=max(-min(item['layer'] for item in group),min(15-max(item['layer'] for item in group),layer_delta))
+            for item in group:
+                clip=self.editor.by_id(item['uid'])
+                if clip:clip.offset=item['offset']+delta;clip.layer=item['layer']+layer_delta
+        elif d['mode']=='left':
+            lower=max(-d['offset'],-d['start']) if c.kind in ('video','audio') else -d['offset']
+            delta=min(d['duration']-.04,max(lower,delta));c.offset=d['offset']+delta;c.duration=d['duration']-delta
+            c.keyframes=[{'time':float(point['time'])-delta,'values':copy.deepcopy(point.get('values',{}))} for point in d['keyframes'] if float(point['time'])>delta and float(point['time'])-delta<c.duration-.04]
+            if c.kind in ('video','audio'):c.start=d['start']+delta
+        else:
+            c.duration=max(.04,min(c.source_duration-c.start,d['duration']+delta))
+            c.keyframes=[point for point in d['keyframes'] if float(point['time'])<c.duration-.04]
+        self.editor.dirty=True;self.refresh();self.editor.update_properties();self.editor.update_title()
+        if d['mode']=='keyframe' and d['point_index'] is not None:
+            self.editor.select_segment(c.uid,c.offset+float(c.keyframes[d['point_index']]['time']))
+
+    def mouseReleaseEvent(self, event):
+        if event.button()==Qt.RightButton and self.right_press:
+            press=self.right_press
+            moved=press['moved']
+            if self.selection_mode=='right':
+                if moved:self.select_in_rectangle(bool(press['modifiers'] & (Qt.ControlModifier|Qt.ShiftModifier)))
+                self.selection_rect=None;self.selection_mode=None;self.update()
+            if not moved:
+                if press['hit']:
+                    if press['hit'] not in self.selected_uids:self.apply_selection({press['hit']},press['hit'],self.time_at(event.pos().x()))
+                    else:self.apply_selection(self.selected_uids,press['hit'],self.time_at(event.pos().x()))
+                QTimer.singleShot(0,lambda p=QPoint(event.pos()),g=QPoint(event.globalPos()):self.show_timeline_menu(p,g))
+            self.right_press=None
+            event.accept();return
+        if self.selection_mode=='left':
+            self.selection_current=QPoint(event.pos());self.selection_rect=QRectF(self.selection_origin,self.selection_current).normalized()
+            if self.selection_rect.width()+self.selection_rect.height()>=5:self.select_in_rectangle(True)
+            self.selection_rect=None;self.selection_mode=None;self.update();event.accept();return
+        if self.scrubbing:self.editor.seek(self.time_at(event.pos().x()))
+        drag=self.drag
+        self.scrubbing,self.drag=False,None
+        moved=bool(drag and drag['saved'])
+        if drag and not moved and drag['mode']=='move' and abs(event.pos().x()-drag['x'])+abs(event.pos().y()-drag['y'])>=3:
+            group=drag['group'] or [{'uid':drag['uid'],'offset':drag['offset'],'layer':drag['layer']}]
+            delta=round((event.pos().x()-drag['x'])/self.scale*self.editor.output_fps)/self.editor.output_fps
+            delta=max(-min(item['offset'] for item in group),delta)
+            layer_delta=round((event.pos().y()-drag['y'])/self.ROW)
+            layer_delta=max(-min(item['layer'] for item in group),min(15-max(item['layer'] for item in group),layer_delta))
+            if delta or layer_delta:
+                self.editor.checkpoint()
+                for item in group:
+                    clip=self.editor.by_id(item['uid'])
+                    if clip:clip.offset=item['offset']+delta;clip.layer=item['layer']+layer_delta
+                self.editor.dirty=True;self.editor.update_title();moved=True
+        if drag and not moved and drag['group'] and not drag['modifiers']:
+            self.apply_selection({drag['uid']},drag['uid'],self.time_at(event.pos().x()))
+        if moved:self.editor.refresh()
+
+    def contextMenuEvent(self, event):
+        event.accept()
+
+    def leaveEvent(self, event):
+        self.resize_lock=False
+        self.unsetCursor()
+        super().leaveEvent(event)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls() or event.mimeData().hasText():

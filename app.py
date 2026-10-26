@@ -8,10 +8,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from PyQt5.QtCore import Qt, QTimer, QProcess, QSettings, QUrl, QEvent
-from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap, QKeySequence, QDesktopServices
+from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap, QKeySequence, QDesktopServices, QIcon
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QDockWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QAbstractItemView, QFormLayout, QDoubleSpinBox, QComboBox, QFileDialog, QMessageBox, QAction, QScrollArea, QSlider, QProgressBar, QShortcut, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QInputDialog, QColorDialog, QDialog, QDialogButtonBox, QSpinBox, QCheckBox)
-from core import Clip, probe, total_duration, save_project, load_project, render_command, active_visuals, animated_value, video_stream_command, audio_stream_command
+from core import Clip, probe, total_duration, save_project, load_project, render_command, active_visuals, animated_value, video_stream_command, audio_stream_command, font_families
 from widgets import Timeline, CompositionView
 
 STYLE = '''
@@ -55,6 +56,7 @@ class Editor(QMainWindow):
     def __init__(self):
         super().__init__()
         self.clips, self.selected, self.position = [], None, 0.0
+        self.timeline_clipboard = []
         self.selected_segment = 0
         self.output_resolution, self.output_fps = '1920x1080', 60
         self.history, self.future = [], []
@@ -69,6 +71,7 @@ class Editor(QMainWindow):
         self.playback_frame = None
         self.audio_decoder = None
         self.playback = None
+        self.playback_hwaccel = True
         self.playback_buffer = bytearray()
         self.playback_frames = 0
         self.play_timer = QTimer(self)
@@ -225,6 +228,25 @@ class Editor(QMainWindow):
         self.text_timer=QTimer(self);self.text_timer.setSingleShot(True);self.text_timer.timeout.connect(self.apply_text);self.text_editor.textChanged.connect(self.text_edited)
         layout.addWidget(self.text_editor)
         self.color_button=button('文字色を変更…',self.choose_color);layout.addWidget(self.color_button)
+        self.text_style_box=QWidget();style_form=QFormLayout(self.text_style_box)
+        self.font_family_combo=QComboBox();self.font_family_combo.addItems(font_families());self.font_family_combo.currentTextChanged.connect(self.apply_text_style)
+        style_form.addRow('フォント',self.font_family_combo)
+        self.outline_width=QSpinBox();self.outline_width.setRange(0,40);self.outline_width.valueChanged.connect(self.apply_text_style)
+        self.outline_color_button=button('縁取り色を変更…',self.choose_outline_color)
+        outline_row=QHBoxLayout();outline_row.addWidget(self.outline_width);outline_row.addWidget(QLabel('px'));outline_row.addWidget(self.outline_color_button,1)
+        style_form.addRow('縁取り',outline_row)
+        self.shadow_size=QSpinBox();self.shadow_size.setRange(0,40);self.shadow_size.valueChanged.connect(self.apply_text_style)
+        self.shadow_blur=QSpinBox();self.shadow_blur.setRange(0,40);self.shadow_blur.valueChanged.connect(self.apply_text_style)
+        self.shadow_color_button=button('影の色を変更…',self.choose_shadow_color)
+        shadow_row=QWidget();shadow_layout=QHBoxLayout(shadow_row);shadow_layout.setContentsMargins(0,0,0,0)
+        shadow_layout.addWidget(QLabel('太さ'));shadow_layout.addWidget(self.shadow_size);shadow_layout.addWidget(QLabel('ぼかし'));shadow_layout.addWidget(self.shadow_blur);shadow_layout.addWidget(self.shadow_color_button)
+        style_form.addRow('影',shadow_row)
+        layout.addWidget(self.text_style_box)
+        self.filter_box=QWidget();filter_row=QHBoxLayout(self.filter_box);filter_row.setContentsMargins(0,0,0,0)
+        self.filter_strength_label=QLabel('効果の強さ')
+        self.filter_strength_spin=QSpinBox();self.filter_strength_spin.setRange(1,100);self.filter_strength_spin.valueChanged.connect(self.apply_filter_strength)
+        filter_row.addWidget(self.filter_strength_label);filter_row.addWidget(self.filter_strength_spin);filter_row.addStretch()
+        layout.addWidget(self.filter_box)
         hint=QLabel('左右の値はタイムラインで選択した区間の移動前・後です。中間点は素材の右クリックから追加します。\nレイヤー番号が大きい素材を手前に表示します。')
         hint.setObjectName('muted');hint.setWordWrap(True);layout.addWidget(hint);layout.addStretch()
         scroll=QScrollArea();scroll.setWidget(box);scroll.setWidgetResizable(True)
@@ -259,7 +281,7 @@ class Editor(QMainWindow):
         scroll.setWidget(self.timeline)
         scroll.setWidgetResizable(True)
         layout.addWidget(scroll)
-        hint = QLabel('目盛り・空白をドラッグ：シーク  /  素材をドラッグ：時刻・レイヤー変更  /  端をドラッグ：長さ変更  /  ファイルをドロップ：追加')
+        hint = QLabel('空白をクリック・ドラッグ：カーソル移動  /  素材本体をドラッグ：移動  /  端をドラッグ：長さ変更  /  ファイルをドロップ：追加')
         hint.setWordWrap(True)
         hint.setObjectName('muted')
         layout.addWidget(hint)
@@ -430,10 +452,15 @@ class Editor(QMainWindow):
 
     def refresh(self):
         self.loading = True
+        if hasattr(self, 'timeline'):
+            valid={c.uid for c in self.clips}
+            self.timeline.selected_uids.intersection_update(valid)
+            if self.selected and self.selected not in self.timeline.selected_uids:
+                self.timeline.selected_uids={self.selected}
         self.list.clear()
         for c in self.clips:
             tag = {'video':'映像', 'audio':'音声', 'image':'画像', 'text':'文字','filter':'フィルタ'}[c.kind]
-            layer_label='' if c.kind=='filter' else f'  L{c.layer+1}'
+            layer_label=f'  L{c.layer+1}'
             item = QListWidgetItem(f'{tag}{layer_label}  {c.name}  ·  {stamp(c.offset)} — {stamp(c.offset+c.duration)}')
             item.setData(Qt.UserRole, c.uid)
             self.list.addItem(item)
@@ -454,6 +481,8 @@ class Editor(QMainWindow):
             self.apply_text()
         if uid != self.selected:self.selected_segment=0
         self.selected = uid
+        if hasattr(self, 'timeline'):
+            self.timeline.selected_uids={uid} if uid else set()
         self.loading = True
         for i in range(self.list.count()):
             item = self.list.item(i)
@@ -518,7 +547,20 @@ class Editor(QMainWindow):
             field.setValue(value)
         is_text=c is not None and c.kind=='text'
         self.text_editor.setVisible(is_text);self.color_button.setVisible(is_text)
+        self.text_style_box.setVisible(is_text)
+        for widget in (self.font_family_combo,self.outline_width,self.shadow_size,self.shadow_blur,self.outline_color_button,self.shadow_color_button):widget.setEnabled(is_text)
+        if is_text:
+            if self.font_family_combo.findText(c.font_family)<0:self.font_family_combo.addItem(c.font_family)
+            self.font_family_combo.setCurrentText(c.font_family)
+            self.outline_width.setValue(c.outline_width);self.shadow_size.setValue(c.shadow_size);self.shadow_blur.setValue(c.shadow_blur)
+            self.outline_color_button.setText(f'縁取り色 {c.outline_color}')
+            self.shadow_color_button.setText(f'影の色 {c.shadow_color}')
         if is_text and self.text_editor.toPlainText()!=c.text:self.text_editor.setPlainText(c.text)
+        is_filter=c is not None and c.kind=='filter'
+        self.filter_box.setVisible(is_filter)
+        if is_filter:
+            self.filter_strength_label.setText({'blur':'ぼかし半径','mosaic':'粒子サイズ','fade':'フェード時間（0.01秒単位）','scenechange':'切替時間（0.01秒単位）'}.get(c.filter_type,'効果の強さ'))
+            self.filter_strength_spin.setValue(c.filter_strength)
         if c:
             _,_,a_time,b_time=self.property_segment(c,self.motion_key or next(iter(visible_keys),'x'))
             self.keyframe_segment_label.setText(f'区間 {self.selected_segment+1}  ·  {c.offset+a_time:.2f} 秒  →  {c.offset+b_time:.2f} 秒')
@@ -621,10 +663,10 @@ class Editor(QMainWindow):
         self.select(uid);self.selected_segment=sum(1 for point in c.keyframes if float(point['time'])<=local);self.dirty=True;self.seek(c.offset+local);self.refresh()
         self.statusBar().showMessage(f'中間点を {local:.2f} 秒に追加しました',3000)
 
-    def add_filter(self,filter_type,offset):
+    def add_filter(self,filter_type,offset,layer=0):
         if filter_type not in ('scenechange','fade','mosaic','blur'):return
         self.checkpoint()
-        clip=Clip('', 'filter', 86400, duration=2.0, offset=max(0.0,offset), filter_type=filter_type)
+        clip=Clip('', 'filter', 86400, duration=2.0, offset=max(0.0,offset), layer=max(0,min(15,layer)), filter_type=filter_type)
         self.clips.append(clip);self.selected=clip.uid;self.selected_segment=0
         self.changed()
         self.statusBar().showMessage(f'{clip.name} フィルタを追加しました',3000)
@@ -634,6 +676,56 @@ class Editor(QMainWindow):
         if not clip:return
         self.checkpoint();self.clips.remove(clip)
         if self.selected==uid:self.selected=None
+        self.changed()
+
+    def copy_timeline_clips(self,uids):
+        chosen=set(uids)
+        self.timeline_clipboard=copy.deepcopy([c for c in self.clips if c.uid in chosen])
+
+    def cut_timeline_clips(self,uids):
+        chosen=set(uids)
+        if not chosen:return
+        copied=[c for c in self.clips if c.uid in chosen]
+        if not copied:return
+        self.checkpoint()
+        self.timeline_clipboard=copy.deepcopy(copied)
+        self.clips=[c for c in self.clips if c.uid not in chosen]
+        if self.selected in chosen:self.selected=None
+        self.timeline.selected_uids.difference_update(chosen)
+        self.changed()
+
+    def paste_timeline_clips(self,position):
+        if not self.timeline_clipboard:return
+        self.checkpoint()
+        origin=min(c.offset for c in self.timeline_clipboard)
+        pasted=[]
+        for source in self.timeline_clipboard:
+            clip=copy.deepcopy(source)
+            clip.uid=uuid.uuid4().hex
+            clip.offset=max(0.0,position+(source.offset-origin))
+            pasted.append(clip)
+        self.clips.extend(pasted)
+        self.selected=pasted[0].uid
+        self.timeline.selected_uids={c.uid for c in pasted}
+        self.changed()
+
+    def duplicate_timeline_clips(self,uids):
+        chosen=set(uids)
+        sources=[c for c in self.clips if c.uid in chosen]
+        if not sources:return
+        self.checkpoint()
+        origin=min(c.offset for c in sources)
+        shift=max(c.offset+c.duration for c in sources)-origin
+        shift=max(1/self.output_fps,shift)
+        duplicates=[]
+        for source in sources:
+            clip=copy.deepcopy(source)
+            clip.uid=uuid.uuid4().hex
+            clip.offset=source.offset+shift
+            duplicates.append(clip)
+        self.clips.extend(duplicates)
+        self.selected=duplicates[0].uid
+        self.timeline.selected_uids={c.uid for c in duplicates}
         self.changed()
 
     def remove_keyframe(self,uid,local_time):
@@ -1014,12 +1106,14 @@ class Editor(QMainWindow):
             if not job['cancelled']:
                 QMessageBox.warning(self, '書き出しエラー', job['log'][-3500:] or 'FFmpeg を起動できませんでした。')
 
-    def start_playback(self):
+    def start_playback(self, hardware_retry=False):
+        if not hardware_retry:
+            self.playback_hwaccel = True
         self.stop_playback()
         self.frame_timer.stop()
         snapshot = copy.deepcopy(self.clips)
         try:
-            video_args = video_stream_command(snapshot, self.position, self.temp.name)
+            video_args = video_stream_command(snapshot, self.position, self.temp.name, hardware_decode=self.playback_hwaccel)
             audio_args = audio_stream_command(snapshot, self.position, self.temp.name)
         except Exception as e:
             QMessageBox.warning(self, '再生エラー', str(e))
@@ -1082,6 +1176,12 @@ class Editor(QMainWindow):
             self.update_properties()
         if self.playback_eof and len(self.playback_buffer) < size:
             code, log = self.playback_exit_code, self.playback_log
+            if code != 0 and self.playback_hwaccel:
+                self.stop_playback()
+                self.playback_hwaccel = False
+                self.statusBar().showMessage('GPUデコードで再生できないため、CPUデコードで再試行します', 5000)
+                self.start_playback(hardware_retry=True)
+                return
             self.stop_playback()
             self.request_edit_frame()
             if code != 0:
@@ -1181,7 +1281,53 @@ class Editor(QMainWindow):
                 c.color = color.name()
                 self.changed()
 
+    def apply_text_style(self,*args):
+        c=self.current()
+        if self.loading or not c or c.kind!='text':return
+        values={'font_family':self.font_family_combo.currentText(),'outline_width':self.outline_width.value(),'shadow_size':self.shadow_size.value(),'shadow_blur':self.shadow_blur.value()}
+        if all(getattr(c,key)==value for key,value in values.items()):return
+        self.checkpoint()
+        for key,value in values.items():setattr(c,key,value)
+        self.changed()
+
+    def apply_filter_strength(self,value):
+        c=self.current()
+        if self.loading or not c or c.kind!='filter' or c.filter_strength==value:return
+        self.checkpoint();c.filter_strength=value;self.changed()
+
+    def choose_outline_color(self):
+        c=self.current()
+        if c and c.kind=='text':
+            color=QColorDialog.getColor(QColor(c.outline_color),self,'縁取り色')
+            if color.isValid():self.checkpoint();c.outline_color=color.name();self.changed()
+
+    def choose_shadow_color(self):
+        c=self.current()
+        if c and c.kind=='text':
+            color=QColorDialog.getColor(QColor(c.shadow_color),self,'影の色')
+            if color.isValid():self.checkpoint();c.shadow_color=color.name();self.changed()
+
     def eventFilter(self, obj, event):
+        if event.type()==QEvent.MouseMove and hasattr(self,'timeline') and self.timeline.drag is not None:
+            buttons=event.buttons()|QApplication.mouseButtons()
+            if buttons & Qt.LeftButton:
+                self.timeline.drag_to(self.timeline.mapFromGlobal(event.globalPos()))
+        if event.type()==QEvent.KeyPress and event.modifiers() & Qt.ControlModifier:
+            focus=QApplication.focusWidget()
+            window=QApplication.activeWindow()
+            ours=window is self or window in self.docks()
+            text_focus=isinstance(focus,(QLineEdit,QTextEdit,QPlainTextEdit,QAbstractSpinBox))
+            if ours and not text_focus:
+                selected=set(self.timeline.selected_uids)
+                if not selected and self.selected:selected={self.selected}
+                if event.key()==Qt.Key_C:
+                    self.copy_timeline_clips(selected);return True
+                if event.key()==Qt.Key_X:
+                    self.cut_timeline_clips(selected);return True
+                if event.key()==Qt.Key_V:
+                    self.paste_timeline_clips(self.position);return True
+                if event.key()==Qt.Key_D:
+                    self.duplicate_timeline_clips(selected);return True
         if event.type() in (QEvent.KeyPress, QEvent.KeyRelease) and event.key() == Qt.Key_Space and event.modifiers() == Qt.NoModifier:
             focus = QApplication.focusWidget()
             window = QApplication.activeWindow()
@@ -1224,6 +1370,7 @@ class Editor(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName('Linux Movie Builder')
+    app.setWindowIcon(QIcon(str(Path(__file__).with_name('linux-movie-builder.png'))))
     app.setStyle('Fusion')
     app.setStyleSheet(STYLE)
     editor = Editor()
