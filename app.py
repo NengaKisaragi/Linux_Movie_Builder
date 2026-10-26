@@ -97,7 +97,7 @@ class Editor(QMainWindow):
         else:
             self.layout_timer = QTimer(self)
             self.layout_timer.setSingleShot(True)
-            self.layout_timer.timeout.connect(self.four_windows)
+            self.layout_timer.timeout.connect(self.reset_to_default_layout)
             self.layout_timer.start(100)
         QApplication.instance().installEventFilter(self)
         self.refresh()
@@ -285,6 +285,7 @@ class Editor(QMainWindow):
         view = self.menuBar().addMenu('ウインドウ')
         view.addAction('4ウインドウに分割', self.four_windows)
         view.addAction('1ウインドウにまとめる', self.join_windows)
+        view.addAction('ウインドウ位置をリセット', self.reset_window_layout)
         view.addSeparator()
         for dock in self.docks():
             view.addAction(dock.toggleViewAction())
@@ -362,16 +363,45 @@ class Editor(QMainWindow):
             dock.setGeometry(*rect)
             dock.show()
 
+    def reset_to_default_layout(self):
+        if hasattr(self, 'layout_timer'):
+            self.layout_timer.stop()
+        for dock,title in zip(self.docks(),('プレビュー','プロパティ','タイムライン')):
+            dock.setWindowTitle(title)
+            dock.setFloating(False)
+            dock.show()
+        self.addDockWidget(Qt.RightDockWidgetArea,self.preview_dock)
+        self.splitDockWidget(self.preview_dock,self.props_dock,Qt.Vertical)
+        self.addDockWidget(Qt.BottomDockWidgetArea,self.timeline_dock)
+        screen=QApplication.primaryScreen().availableGeometry()
+        width=max(320,min(1280,screen.width()-40))
+        height=max(360,min(850,screen.height()-80))
+        self.setGeometry(screen.x()+(screen.width()-width)//2,screen.y()+(screen.height()-height)//2,width,height)
+        self.showNormal()
+
+    def reset_window_layout(self):
+        self.config.remove('geometry')
+        self.config.remove('state')
+        self.reset_to_default_layout()
+        self.config.setValue('geometry',self.saveGeometry())
+        self.config.setValue('state',self.saveState())
+        self.config.sync()
+        self.statusBar().showMessage('ウインドウ配置を初期状態に戻しました',4000)
+
     def join_windows(self):
         if hasattr(self, 'layout_timer'):
             self.layout_timer.stop()
-        for dock in self.docks():
+        for dock,title in zip(self.docks(),('プレビュー','プロパティ','タイムライン')):
+            dock.setWindowTitle(title)
             dock.setFloating(False)
             dock.show()
         self.addDockWidget(Qt.RightDockWidgetArea, self.preview_dock)
         self.splitDockWidget(self.preview_dock, self.props_dock, Qt.Vertical)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.timeline_dock)
-        self.resize(1280, 850)
+        screen=QApplication.primaryScreen().availableGeometry()
+        width=max(320,min(1280,screen.width()-40))
+        height=max(360,min(850,screen.height()-80))
+        self.resize(width,height)
 
     def current(self):
         return next((c for c in self.clips if c.uid == self.selected), None)
