@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+window-layout.ini
+*.lmb
+*.mp4
+*.mkv
+*.mov
+*.wav
+*.mp3
