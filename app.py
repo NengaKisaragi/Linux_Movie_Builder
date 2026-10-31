@@ -274,6 +274,7 @@ class Editor(QMainWindow):
         zoom.setValue(65)
         zoom.setMaximumWidth(140)
         zoom.valueChanged.connect(self.zoom)
+        self.timeline_zoom = zoom
         row.addWidget(zoom)
         layout.addLayout(row)
         self.timeline = Timeline(self)

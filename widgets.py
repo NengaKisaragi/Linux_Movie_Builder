@@ -2,7 +2,7 @@
 import copy
 from PyQt5.QtCore import Qt, QRectF, QPointF, QPoint, QTimer
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
-from PyQt5.QtWidgets import QApplication, QWidget, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsItem, QMenu
+from PyQt5.QtWidgets import QApplication, QWidget, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsItem, QMenu, QScrollArea
 from core import BASE_W, BASE_H, total_duration, placed_size, active_visuals, text_image, animated_value
 
 
@@ -184,6 +184,40 @@ class Timeline(QWidget):
         desired_width=max(1100,int(max(30,total_duration(self.editor.clips)+15)*self.scale)+185)
         visible_width=max(self.width(),desired_width)
         return max(total_duration(self.editor.clips)+15,30.0,(visible_width-185)/self.scale)
+
+    def wheelEvent(self, event):
+        delta=event.angleDelta().y()
+        if not delta:
+            event.ignore()
+            return
+        scroll=self.parentWidget()
+        while scroll is not None and not isinstance(scroll,QScrollArea):
+            scroll=scroll.parentWidget()
+        steps=delta/120
+        if event.modifiers() & Qt.ControlModifier:
+            if scroll is not None:
+                bar=scroll.verticalScrollBar()
+                bar.setValue(bar.value()-round(steps*self.ROW))
+            event.accept()
+            return
+
+        slider=getattr(self.editor,'timeline_zoom',None)
+        if slider is None:
+            event.ignore()
+            return
+        old_scale=self.scale
+        new_scale=max(slider.minimum(),min(slider.maximum(),old_scale+round(steps*5)))
+        if new_scale==old_scale:
+            event.accept()
+            return
+        cursor_x=event.pos().x()
+        horizontal=scroll.horizontalScrollBar() if scroll is not None else None
+        viewport_x=cursor_x-horizontal.value() if horizontal is not None else cursor_x
+        anchor_time=max(0.0,(cursor_x-self.LEFT)/old_scale)
+        slider.setValue(new_scale)
+        if horizontal is not None:
+            horizontal.setValue(round(self.LEFT+anchor_time*self.scale-viewport_x))
+        event.accept()
 
     def time_at(self, x):
         fps = self.editor.output_fps
