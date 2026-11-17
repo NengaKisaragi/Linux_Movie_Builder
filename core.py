@@ -26,6 +26,8 @@ class Clip:
     duration: float = 0.0
     offset: float = 0.0
     volume: float = 1.0
+    fade_in: float = 0.0
+    fade_out: float = 0.0
     has_audio: bool = False
     uid: str = ''
     layer: int = 0
@@ -98,15 +100,35 @@ def font_families():
         return ('既定',)
 
 
+@lru_cache(maxsize=1)
+def _font_files_by_family():
+    """Map fontconfig family names to the actual files installed for them."""
+    try:
+        result=subprocess.run(['fc-list','--format','%{family}\t%{style}\t%{file}\n'],capture_output=True,text=True,timeout=3,check=True)
+        candidates={}
+        for line in result.stdout.splitlines():
+            parts=line.split('\t',2)
+            if len(parts)!=3:
+                continue
+            names,style,path=parts
+            if not Path(path).is_file():
+                continue
+            style=style.casefold()
+            priority=0 if style in ('regular','book','normal') else 1
+            for name in names.split(','):
+                key=' '.join(name.strip().casefold().split())
+                if key and (key not in candidates or priority<candidates[key][0]):
+                    candidates[key]=(priority,path)
+        return {name:path for name,(_,path) in candidates.items()}
+    except (OSError,subprocess.SubprocessError):
+        return {}
+
+
 @lru_cache(maxsize=128)
 def font_path_for_family(family):
     if family=='既定' or not family:return FONT
-    try:
-        result=subprocess.run(['fc-match','--format','%{file}',family],capture_output=True,text=True,timeout=3,check=True)
-        path=result.stdout.strip()
-        return path if path and Path(path).is_file() else FONT
-    except (OSError,subprocess.SubprocessError):
-        return FONT
+    key=' '.join(family.strip().casefold().split())
+    return _font_files_by_family().get(key,FONT)
 
 
 def text_image(clip, directory):
@@ -165,10 +187,10 @@ def validate(clips):
             raise ValueError('フィルタの種類が無効です')
         if c.kind=='filter' and not 1<=c.filter_strength<=100:
             raise ValueError('フィルタの強さは1〜100で指定してください')
-        for n in (c.source_duration, c.start, c.duration, c.offset, c.volume, c.x, c.y, c.scale, c.opacity, c.rotation, c.width, c.height, c.font_size, c.filter_strength):
+        for n in (c.source_duration, c.start, c.duration, c.offset, c.volume, c.fade_in, c.fade_out, c.x, c.y, c.scale, c.opacity, c.rotation, c.width, c.height, c.font_size, c.filter_strength):
             if not isinstance(n, (float, int)) or not math.isfinite(n):
                 raise ValueError('数値が無効です')
-        if c.duration < .04 or c.start < 0 or c.offset < 0 or not 0 <= c.volume <= 2:
+        if c.duration < .04 or c.start < 0 or c.offset < 0 or not 0 <= c.volume <= 2 or not 0 <= c.fade_in <= c.duration or not 0 <= c.fade_out <= c.duration:
             raise ValueError('クリップの範囲または音量が無効です')
         if c.start+c.duration > c.source_duration+.05:
             raise ValueError('素材の長さを超えています')
@@ -411,7 +433,17 @@ def composition(clips, resolution, fps, directory, position=0, realtime=False, v
                 millis = round(delay*1000)
                 label = f'a{i}'
                 vol = _expr(c, 'volume', c.volume, time=f't+{position:.9g}')
-                filters.append(f"[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={remaining:.6f},asetpts=PTS-STARTPTS+{delay:.6f}/TB,volume=volume='{vol}':eval=frame,adelay={millis}|{millis}[{label}]")
+                gain=vol
+                sep=r'\,'
+                if c.fade_in>0:
+                    fade_in=min(c.fade_in,c.duration)
+                    ramp=f"min(max((t+{position:.9g}-{c.offset:.9g})/{fade_in:.9g}{sep}0){sep}1)"
+                    gain=f'({gain})*({ramp})'
+                if c.fade_out>0:
+                    fade_out=min(c.fade_out,c.duration)
+                    ramp=f"min(max(({c.offset+c.duration:.9g}-(t+{position:.9g}))/{fade_out:.9g}{sep}0){sep}1)"
+                    gain=f'({gain})*({ramp})'
+                filters.append(f"[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,atrim=duration={remaining:.6f},asetpts=PTS-STARTPTS+{delay:.6f}/TB,volume=volume='{gain}':eval=frame,adelay={millis}|{millis}[{label}]")
                 audio_tracks.append(f'[{label}]')
     if video:
         filters.append(f'[{current_video}]trim=duration={duration:.6f},format=rgb24[video]')

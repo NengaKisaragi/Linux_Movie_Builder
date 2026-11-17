@@ -1,9 +1,57 @@
 """Interactive composition canvas and layered timeline."""
 import copy
-from PyQt5.QtCore import Qt, QRectF, QPointF, QPoint, QTimer
+import struct
+import subprocess
+from pathlib import Path
+from PyQt5.QtCore import Qt, QRectF, QPointF, QPoint, QTimer, QObject, QRunnable, QThreadPool, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QApplication, QWidget, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsItem, QMenu, QScrollArea
 from core import BASE_W, BASE_H, total_duration, placed_size, active_visuals, text_image, animated_value
+
+
+class WaveformSignals(QObject):
+    ready = pyqtSignal(str, object)
+
+
+class WaveformTask(QRunnable):
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self.signals = WaveformSignals()
+
+    def run(self):
+        peaks=[]
+        process=None
+        try:
+            process=subprocess.Popen(
+                ['ffmpeg','-hide_banner','-nostdin','-v','error','-i',self.path,'-map','0:a:0','-vn','-ac','1','-ar','2000','-f','s16le','pipe:1'],
+                stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+            samples_per_peak=20
+            peak=count=0
+            carry=b''
+            while True:
+                chunk=process.stdout.read(65536)
+                if not chunk:break
+                data=carry+chunk
+                usable=len(data)-(len(data)%2)
+                carry=data[usable:]
+                for (sample,) in struct.iter_unpack('<h',data[:usable]):
+                    peak=max(peak,abs(sample))
+                    count+=1
+                    if count==samples_per_peak:
+                        peaks.append(peak/32768.0)
+                        peak=count=0
+            if count:
+                peaks.append(peak/32768.0)
+            if process.wait()!=0:
+                peaks=[]
+        except (OSError,ValueError):
+            peaks=[]
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+        self.signals.ready.emit(self.path,peaks)
 
 
 class VisualItem(QGraphicsPixmapItem):
@@ -168,6 +216,8 @@ class Timeline(QWidget):
         self.selection_mode = None
         self.right_press = None
         self.resize_lock = False
+        self.waveforms = {}
+        self.waveform_workers = {}
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setMinimumHeight(290)
@@ -178,6 +228,25 @@ class Timeline(QWidget):
     def refresh(self):
         self.setMinimumWidth(max(1100, int(max(30,total_duration(self.editor.clips)+15)*self.scale)+185))
         self.setMinimumHeight(self.TOP+self.ROW*self.layer_count()+30)
+        self.request_waveforms()
+        self.update()
+
+    def request_waveforms(self):
+        for clip in self.editor.clips:
+            if not (clip.kind=='audio' or clip.has_audio):
+                continue
+            path=str(Path(clip.path).resolve())
+            if path in self.waveforms or path in self.waveform_workers:
+                continue
+            worker=WaveformTask(path)
+            worker.signals.ready.connect(self.waveform_ready)
+            self.waveform_workers[path]=worker
+            QThreadPool.globalInstance().start(worker)
+
+    def waveform_ready(self,path,peaks):
+        self.waveform_workers.pop(path,None)
+        if peaks:
+            self.waveforms[path]=peaks
         self.update()
 
     def seek_limit(self):
@@ -267,6 +336,25 @@ class Timeline(QWidget):
                 p.setPen(QPen(QColor('#a0caff'),2))
                 p.setBrush(Qt.NoBrush)
                 p.drawRoundedRect(rect,4,4)
+            if c.kind=='audio' or c.has_audio:
+                peaks=self.waveforms.get(str(Path(c.path).resolve()))
+                if peaks:
+                    visible=rect.intersected(QRectF(event.rect())).adjusted(3,3,-3,-3)
+                    if not visible.isEmpty():
+                        p.save()
+                        p.setClipRect(visible)
+                        color=QColor('#b8f4df' if c.kind=='audio' else '#c4dafa')
+                        color.setAlpha(180 if selected else 135)
+                        p.setPen(QPen(color,1))
+                        baseline=rect.bottom()-11
+                        half_height=max(2,min(9,(rect.height()-8)/2))
+                        for x in range(max(0,int(visible.left())),min(self.width(),int(visible.right())+1)):
+                            local_time=c.start+(x-(self.LEFT+c.offset*self.scale))/self.scale
+                            peak_index=int(max(0,local_time)*100)
+                            if peak_index<len(peaks):
+                                amplitude=peaks[peak_index]*half_height
+                                p.drawLine(x,int(baseline-amplitude),x,int(baseline+amplitude))
+                        p.restore()
             p.save()
             p.setClipRect(rect.adjusted(5, 2, -4, -2))
             p.setPen(QColor('#eef4ff'))

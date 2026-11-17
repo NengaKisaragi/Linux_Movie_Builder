@@ -39,6 +39,8 @@ QProgressBar { border:1px solid #354054; border-radius:3px; text-align:center; }
 QProgressBar::chunk { background:#347bda; }
 '''
 
+APP_VERSION = '1.01'
+
 
 def stamp(sec):
     return f'{int(sec)//60:02d}:{int(sec)%60:02d}.{int(sec*100)%100:02d}'
@@ -79,7 +81,7 @@ class Editor(QMainWindow):
         self.play_timer.timeout.connect(self.display_playback_frame)
         self.temp = tempfile.TemporaryDirectory(prefix='linux-movie-builder-')
         self.config = QSettings(str(Path(__file__).with_name('window-layout.ini')), QSettings.IniFormat)
-        self.setWindowTitle('Linux Movie Builder — 編集画面')
+        self.setWindowTitle(f'Linux Movie Builder v{APP_VERSION} — 編集画面')
         self.resize(1160, 780)
         self.setAcceptDrops(True)
         self.build_edit()
@@ -217,7 +219,7 @@ class Editor(QMainWindow):
         form=QFormLayout()
         self.clip_fields={}
         self.clip_field_rows={}
-        for key,label,low,high,decimals,step in [('start','素材の開始（秒）',0,86400,2,.1),('duration','長さ（秒）',.04,86400,2,.1),('offset','配置時刻（秒）',0,86400,2,.1),('font_size','文字サイズ',8,300,0,2)]:
+        for key,label,low,high,decimals,step in [('start','素材の開始（秒）',0,86400,2,.1),('duration','長さ（秒）',.04,86400,2,.1),('offset','配置時刻（秒）',0,86400,2,.1),('font_size','文字サイズ',8,300,0,2),('fade_in','フェードイン（秒）',0,86400,2,.1),('fade_out','フェードアウト（秒）',0,86400,2,.1)]:
             field=QDoubleSpinBox();field.setRange(low,high);field.setDecimals(decimals);field.setSingleStep(step);field.setKeyboardTracking(False)
             field.valueChanged.connect(self.apply_properties)
             self.clip_fields[key]=field
@@ -449,7 +451,7 @@ class Editor(QMainWindow):
         self.request_edit_frame()
 
     def update_title(self):
-        self.setWindowTitle(f'Linux Movie Builder — 編集画面  |  {Path(self.project).name if self.project else "新規プロジェクト"}{" *" if self.dirty else ""}')
+        self.setWindowTitle(f'Linux Movie Builder v{APP_VERSION} — 編集画面  |  {Path(self.project).name if self.project else "新規プロジェクト"}{" *" if self.dirty else ""}')
 
     def refresh(self):
         self.loading = True
@@ -536,12 +538,15 @@ class Editor(QMainWindow):
             self.motion_buttons[key].setChecked(self.motion_key==key)
         for key,field in self.clip_fields.items():
             enabled=c is not None
-            visible= c is not None and ((key=='start' and c.kind in ('video','audio')) or (key in ('duration','offset')) or (key=='font_size' and c.kind=='text'))
+            visible= c is not None and ((key=='start' and c.kind in ('video','audio')) or (key in ('duration','offset')) or (key=='font_size' and c.kind=='text') or (key in ('fade_in','fade_out') and c.has_audio))
             label_widget,field_widget=self.clip_field_rows[key]
             label_widget.setVisible(visible);field_widget.setVisible(visible)
             if c:
                 if key=='start':enabled=c.kind in ('video','audio')
                 if key=='font_size':enabled=c.kind=='text'
+                if key in ('fade_in','fade_out'):
+                    field.setMaximum(max(0,c.duration))
+                    enabled=c.has_audio
             field.setEnabled(enabled)
             if key=='font_size':value=c.font_size if c else 64
             else:value=getattr(c,key) if c else 0
@@ -764,7 +769,10 @@ class Editor(QMainWindow):
         old_duration=c.duration
         for key,field in self.clip_fields.items():
             val=field.value()
-            if key!='font_size' or c.kind=='text':setattr(c,key,int(val) if key=='font_size' else val)
+            if key!='font_size' or c.kind=='text':
+                if key in ('fade_in','fade_out'):
+                    val=min(val,c.duration)
+                setattr(c,key,int(val) if key=='font_size' else val)
         if c.duration<old_duration:
             c.keyframes=[point for point in c.keyframes if float(point['time'])<c.duration-.04]
         self.changed()
@@ -1371,6 +1379,7 @@ class Editor(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName('Linux Movie Builder')
+    app.setApplicationVersion(APP_VERSION)
     app.setWindowIcon(QIcon(str(Path(__file__).with_name('linux-movie-builder.png'))))
     app.setStyle('Fusion')
     app.setStyleSheet(STYLE)
