@@ -289,6 +289,24 @@ def fade_factor(clip, position):
     return f
 
 
+def measure_loudness(clip):
+    """Integrated loudness (LUFS) of the part of the clip's source that is used, or None if silent."""
+    result = subprocess.run(['ffmpeg', '-hide_banner', '-nostats', '-nostdin', '-ss', f'{clip.start:.3f}', '-t', f'{clip.duration*clip.speed:.3f}', '-i', clip.path,
+                             '-map', '0:a:0', '-vn', '-af', 'ebur128', '-f', 'null', '-'], capture_output=True, text=True, timeout=300)
+    summary = result.stderr.rsplit('Integrated loudness:', 1)
+    if len(summary) != 2:
+        return None
+    for line in summary[1].splitlines():
+        line = line.strip()
+        if line.startswith('I:'):
+            try:
+                value = float(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+            return value if value > -70 else None
+    return None
+
+
 def total_duration(clips):
     return max((c.offset+c.duration for c in clips if c.kind!='filter'), default=0.0)
 
@@ -462,7 +480,7 @@ def validate(clips):
             ImageColor.getrgb(c.color)
             if c.shape_type not in SHAPES or not 1<=c.width<=4096 or not 1<=c.height<=4096 or not 0<=c.line_width<=500:
                 raise ValueError('図形の設定が無効です')
-        if c.duration < .04 or c.start < 0 or c.offset < 0 or not 0 <= c.volume <= 2 or not 0 <= c.fade_in <= c.duration or not 0 <= c.fade_out <= c.duration:
+        if c.duration < .04 or c.start < 0 or c.offset < 0 or not 0 <= c.volume <= 30 or not 0 <= c.fade_in <= c.duration or not 0 <= c.fade_out <= c.duration:
             raise ValueError('クリップの範囲または音量が無効です')
         if c.start+c.duration*c.speed > c.source_duration+.05:
             raise ValueError('素材の長さを超えています')

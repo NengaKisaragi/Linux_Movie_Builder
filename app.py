@@ -10,9 +10,9 @@ import tempfile
 import time
 import uuid
 from PyQt5.QtCore import Qt, QTimer, QProcess, QSettings, QUrl, QEvent
-from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap, QKeySequence, QDesktopServices, QIcon
+from PyQt5.QtGui import QValidator, QColor, QPainter, QPen, QPixmap, QKeySequence, QDesktopServices, QIcon
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QDockWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QAbstractItemView, QFormLayout, QDoubleSpinBox, QComboBox, QFileDialog, QMessageBox, QAction, QScrollArea, QSlider, QProgressBar, QShortcut, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QInputDialog, QColorDialog, QDialog, QDialogButtonBox, QSpinBox, QCheckBox)
-from core import MissingMedia, Clip, probe, total_duration, save_project, load_project, render_command, active_visuals, animated_value, video_stream_command, audio_stream_command, font_families, EFFECTS, BLEND_MODES, SHAPES, CODECS, new_effect, effects_graph, placed_size, frame_command, base_for, preview_size
+from core import measure_loudness, MissingMedia, Clip, probe, total_duration, save_project, load_project, render_command, active_visuals, animated_value, video_stream_command, audio_stream_command, font_families, EFFECTS, BLEND_MODES, SHAPES, CODECS, new_effect, effects_graph, placed_size, frame_command, base_for, preview_size
 from widgets import Timeline, CompositionView
 
 STYLE = '''
@@ -40,6 +40,37 @@ QProgressBar::chunk { background:#347bda; }
 '''
 
 APP_VERSION = '1.10'
+
+
+class _ClampMixin:
+    """Let numbers outside the range be typed; the value is clamped when editing finishes.
+
+    Qt otherwise silently drops the keystroke that would exceed the maximum, which looks like
+    a digit limit (e.g. typing a third digit after "40" in a 0-200 field)."""
+    def validate(self, text, pos):
+        state, text, pos = super().validate(text, pos)
+        if state == QValidator.Invalid:
+            try:
+                float(text.replace(',', ''))
+                state = QValidator.Intermediate
+            except ValueError:
+                pass
+        return state, text, pos
+
+    def fixup(self, text):
+        try:
+            value = max(self.minimum(), min(self.maximum(), float(text.replace(',', ''))))
+        except ValueError:
+            return text
+        return f'{value:.{self.decimals()}f}' if isinstance(self, QDoubleSpinBox) else str(int(value))
+
+
+class DoubleBox(_ClampMixin, QDoubleSpinBox):
+    pass
+
+
+class IntBox(_ClampMixin, QSpinBox):
+    pass
 
 
 def stamp(sec):
@@ -187,14 +218,14 @@ class Editor(QMainWindow):
         self.motion_row_widgets = {}
         self.motion_panel = QWidget()
         self.motion_key = None
-        properties = [('x','X',-10000,10000,1,10),('y','Y',-10000,10000,1,10),('scale','拡大率',1,500,1,5),('opacity','透明度',0,100,0,5),('rotation','回転',-3600,3600,1,5),('volume','音量',0,200,0,5)]
+        properties = [('x','X',-10000,10000,1,10),('y','Y',-10000,10000,1,10),('scale','拡大率',1,500,1,5),('opacity','透明度',0,100,0,5),('rotation','回転',-3600,3600,1,5),('volume','音量',0,3000,0,5)]
         column_head=QHBoxLayout();column_head.addWidget(QLabel('移動前'),1);column_head.addWidget(QLabel('項目'));column_head.addWidget(QLabel('移動後'),1);layout.addLayout(column_head)
         self.keyframe_segment_label=QLabel('タイムラインで区間を選択してください')
         self.keyframe_segment_label.setObjectName('muted');layout.addWidget(self.keyframe_segment_label)
         for key, label, low, high, decimals, step in properties:
             row_widget=QWidget();row=QHBoxLayout(row_widget);row.setContentsMargins(0,0,0,0)
-            start=QDoubleSpinBox();start.setRange(low,high);start.setDecimals(decimals);start.setSingleStep(step);start.setKeyboardTracking(False)
-            end=QDoubleSpinBox();end.setRange(low,high);end.setDecimals(decimals);end.setSingleStep(step);end.setKeyboardTracking(False)
+            start=DoubleBox();start.setRange(low,high);start.setDecimals(decimals);start.setSingleStep(step);start.setKeyboardTracking(False)
+            end=DoubleBox();end.setRange(low,high);end.setDecimals(decimals);end.setSingleStep(step);end.setKeyboardTracking(False)
             start.valueChanged.connect(lambda value,k=key:self.change_animation_side(k,'before',value))
             end.valueChanged.connect(lambda value,k=key:self.change_animation_side(k,'after',value))
             toggle=QToolButton();toggle.setText(label);toggle.setCheckable(True);toggle.setMinimumWidth(72);toggle.clicked.connect(lambda checked,k=key:self.toggle_motion(k))
@@ -214,10 +245,10 @@ class Editor(QMainWindow):
             b=QPushButton(name);b.setCheckable(True);b.setAutoDefault(False);b.clicked.connect(lambda checked=False,m=mode:self.choose_motion(m))
             self.mode_buttons[mode]=b
             self.motion_choice_layout.addWidget(b,i//3,i%3)
-        self.repeat_label=QLabel('反復回数');self.repeat_count=QDoubleSpinBox();self.repeat_count.setRange(1,1000);self.repeat_count.setDecimals(0);self.repeat_count.setValue(3)
+        self.repeat_label=QLabel('反復回数');self.repeat_count=DoubleBox();self.repeat_count.setRange(1,1000);self.repeat_count.setDecimals(0);self.repeat_count.setValue(3)
         self.repeat_count.valueChanged.connect(self.change_cycles)
         self.repeat_row=QHBoxLayout();self.repeat_row.addWidget(self.repeat_label);self.repeat_row.addWidget(self.repeat_count);self.repeat_row.addStretch();panel_layout.addLayout(self.repeat_row)
-        self.curve_label=QLabel('曲線の強さ');self.curve_strength=QDoubleSpinBox();self.curve_strength.setRange(1,5);self.curve_strength.setSingleStep(.25);self.curve_strength.setValue(3)
+        self.curve_label=QLabel('曲線の強さ');self.curve_strength=DoubleBox();self.curve_strength.setRange(1,5);self.curve_strength.setSingleStep(.25);self.curve_strength.setValue(3)
         self.curve_strength.valueChanged.connect(self.change_curve)
         self.curve_row=QHBoxLayout();self.curve_row.addWidget(self.curve_label);self.curve_row.addWidget(self.curve_strength);self.curve_row.addStretch();panel_layout.addLayout(self.curve_row)
         self.motion_panel.hide()
@@ -226,7 +257,7 @@ class Editor(QMainWindow):
         self.clip_fields={}
         self.clip_field_rows={}
         for key,label,low,high,decimals,step in [('start','素材の開始（秒）',0,86400,2,.1),('duration','長さ（秒）',.04,86400,2,.1),('offset','配置時刻（秒）',0,86400,2,.1),('speed','再生速度（%）',10,1000,1,10),('pan','左右（-100〜100）',-100,100,0,5),('font_size','文字サイズ',8,300,0,2),('line_spacing','行間',-50,300,0,1),('width','図形の幅',1,4096,0,10),('height','図形の高さ',1,4096,0,10),('line_width','ライン幅（0で塗り）',0,500,0,1),('fade_in','フェードイン（秒）',0,86400,2,.1),('fade_out','フェードアウト（秒）',0,86400,2,.1)]:
-            field=QDoubleSpinBox();field.setRange(low,high);field.setDecimals(decimals);field.setSingleStep(step);field.setKeyboardTracking(False)
+            field=DoubleBox();field.setRange(low,high);field.setDecimals(decimals);field.setSingleStep(step);field.setKeyboardTracking(False)
             field.valueChanged.connect(self.apply_properties)
             self.clip_fields[key]=field
             label_widget=QLabel(label);form.addRow(label_widget,field)
@@ -243,6 +274,9 @@ class Editor(QMainWindow):
         for key,name in (('left','左寄せ'),('center','中央揃え'),('right','右寄せ')):self.align_combo.addItem(name,key)
         self.align_combo.currentIndexChanged.connect(lambda *_:self.apply_choice('text_align',self.align_combo.currentData()))
         self.align_label=QLabel('文字揃え');form.addRow(self.align_label,self.align_combo)
+        self.auto_gain_button=button('音量を自動で合わせる（-16 LUFS）',self.normalize_volume)
+        self.auto_gain_button.setToolTip('素材の実際の大きさを測り、会話向けの標準的な音量になるよう音量を設定します。OBS録音など小さい素材向け。')
+        self.auto_gain_label=QLabel('音量の自動調整');form.addRow(self.auto_gain_label,self.auto_gain_button)
         layout.addLayout(form)
         self.text_editor=QTextEdit();self.text_editor.setPlaceholderText('テキストの内容');self.text_editor.setFixedHeight(85)
         self.text_timer=QTimer(self);self.text_timer.setSingleShot(True);self.text_timer.timeout.connect(self.apply_text);self.text_editor.textChanged.connect(self.text_edited)
@@ -251,12 +285,12 @@ class Editor(QMainWindow):
         self.text_style_box=QWidget();style_form=QFormLayout(self.text_style_box)
         self.font_family_combo=QComboBox();self.font_family_combo.addItems(font_families());self.font_family_combo.currentTextChanged.connect(self.apply_text_style)
         style_form.addRow('フォント',self.font_family_combo)
-        self.outline_width=QSpinBox();self.outline_width.setRange(0,40);self.outline_width.valueChanged.connect(self.apply_text_style)
+        self.outline_width=IntBox();self.outline_width.setRange(0,40);self.outline_width.valueChanged.connect(self.apply_text_style)
         self.outline_color_button=button('縁取り色を変更…',self.choose_outline_color)
         outline_row=QHBoxLayout();outline_row.addWidget(self.outline_width);outline_row.addWidget(QLabel('px'));outline_row.addWidget(self.outline_color_button,1)
         style_form.addRow('縁取り',outline_row)
-        self.shadow_size=QSpinBox();self.shadow_size.setRange(0,40);self.shadow_size.valueChanged.connect(self.apply_text_style)
-        self.shadow_blur=QSpinBox();self.shadow_blur.setRange(0,40);self.shadow_blur.valueChanged.connect(self.apply_text_style)
+        self.shadow_size=IntBox();self.shadow_size.setRange(0,40);self.shadow_size.valueChanged.connect(self.apply_text_style)
+        self.shadow_blur=IntBox();self.shadow_blur.setRange(0,40);self.shadow_blur.valueChanged.connect(self.apply_text_style)
         self.shadow_color_button=button('影の色を変更…',self.choose_shadow_color)
         shadow_row=QWidget();shadow_layout=QHBoxLayout(shadow_row);shadow_layout.setContentsMargins(0,0,0,0)
         shadow_layout.addWidget(QLabel('太さ'));shadow_layout.addWidget(self.shadow_size);shadow_layout.addWidget(QLabel('ぼかし'));shadow_layout.addWidget(self.shadow_blur);shadow_layout.addWidget(self.shadow_color_button)
@@ -264,7 +298,7 @@ class Editor(QMainWindow):
         layout.addWidget(self.text_style_box)
         self.filter_box=QWidget();filter_row=QHBoxLayout(self.filter_box);filter_row.setContentsMargins(0,0,0,0)
         self.filter_strength_label=QLabel('効果の強さ')
-        self.filter_strength_spin=QSpinBox();self.filter_strength_spin.setRange(1,100);self.filter_strength_spin.valueChanged.connect(self.apply_filter_strength)
+        self.filter_strength_spin=IntBox();self.filter_strength_spin.setRange(1,100);self.filter_strength_spin.valueChanged.connect(self.apply_filter_strength)
         filter_row.addWidget(self.filter_strength_label);filter_row.addWidget(self.filter_strength_spin);filter_row.addStretch()
         layout.addWidget(self.filter_box)
         self.build_effect_panel(layout)
@@ -321,7 +355,7 @@ class Editor(QMainWindow):
                     elif spec['type']=='bool':
                         widget=QCheckBox();widget.toggled.connect(lambda value,k=spec['key']:self.change_effect_param(k,1 if value else 0))
                     else:
-                        widget=QDoubleSpinBox();widget.setRange(spec['min'],spec['max']);widget.setDecimals(0 if float(spec['max'])>=10 else 2);widget.setKeyboardTracking(False)
+                        widget=DoubleBox();widget.setRange(spec['min'],spec['max']);widget.setDecimals(0 if float(spec['max'])>=10 else 2);widget.setKeyboardTracking(False)
                         widget.valueChanged.connect(lambda value,k=spec['key']:self.change_effect_param(k,value))
                     self.effect_widgets[spec['key']]=(spec,widget)
                     self.effect_form.addRow(spec['label'],widget)
@@ -392,6 +426,23 @@ class Editor(QMainWindow):
         current=c.effects[self.effect_index].get('params',{}).get(key,'#ffffff')
         color=QColorDialog.getColor(QColor(current),self,'色')
         if color.isValid():self.change_effect_param(key,color.name())
+
+    def normalize_volume(self,target=-16.0):
+        c=self.current()
+        if not c or not (c.kind=='audio' or c.has_audio):return
+        self.stop_playback()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:loudness=measure_loudness(c)
+        except Exception as e:
+            QApplication.restoreOverrideCursor();QMessageBox.warning(self,'測定エラー',str(e));return
+        QApplication.restoreOverrideCursor()
+        if loudness is None:
+            self.statusBar().showMessage('音が小さすぎる（無音）ため、音量を測定できませんでした',6000);return
+        gain=min(30.0,max(0.0,10**((target-loudness)/20)))
+        self.checkpoint();c.volume=round(gain,3);c.animation.pop('volume',None)
+        self.changed()
+        note='（上限3000%）' if gain>=30 else ''
+        self.statusBar().showMessage(f'素材の大きさ {loudness:.1f} LUFS → 音量を {gain*100:.0f}% に設定しました{note}',8000)
 
     def apply_choice(self,key,value):
         c=self.current()
@@ -495,15 +546,15 @@ class Editor(QMainWindow):
         resolution=QComboBox()
         for value in ('1920x1080','1280x720','854x480'):resolution.addItem(value,value)
         resolution.addItem('値を指定…','custom')
-        width=QSpinBox();width.setRange(2,16384);width.setSingleStep(2)
-        height=QSpinBox();height.setRange(2,16384);height.setSingleStep(2)
+        width=IntBox();width.setRange(2,16384);width.setSingleStep(2)
+        height=IntBox();height.setRange(2,16384);height.setSingleStep(2)
         custom_resolution=QWidget();custom_layout=QHBoxLayout(custom_resolution);custom_layout.setContentsMargins(0,0,0,0)
         custom_layout.addWidget(QLabel('幅'));custom_layout.addWidget(width);custom_layout.addWidget(QLabel('高さ'));custom_layout.addWidget(height)
         form.addRow('解像度',resolution);form.addRow('指定サイズ',custom_resolution)
         fps=QComboBox()
         for value in (24,30,60):fps.addItem(f'{value} fps',value)
         fps.addItem('値を指定…','custom')
-        custom_fps=QSpinBox();custom_fps.setRange(1,240);custom_fps.setSuffix(' fps')
+        custom_fps=IntBox();custom_fps.setRange(1,240);custom_fps.setSuffix(' fps')
         form.addRow('フレームレート',fps);form.addRow('指定フレームレート',custom_fps)
         native=QCheckBox('素材を元のピクセルサイズで配置する（AviUtl方式。画面より大きい素材ははみ出します）');native.setChecked(self.media_native);layout.addWidget(native)
         parts=self.output_resolution.split('x')
@@ -832,6 +883,8 @@ class Editor(QMainWindow):
             elif key=='pan':value=c.pan*100
             else:value=getattr(c,key)
             field.setValue(value)
+        has_sound=c is not None and (c.kind=='audio' or c.has_audio)
+        self.auto_gain_label.setVisible(has_sound);self.auto_gain_button.setVisible(has_sound)
         visual=c is not None and c.kind in ('video','image','text','shape')
         for label_widget,widget,show,key in ((self.blend_label,self.blend_combo,visual,'blend'),(self.shape_label,self.shape_combo,c is not None and c.kind=='shape','shape_type'),(self.align_label,self.align_combo,c is not None and c.kind=='text','text_align')):
             label_widget.setVisible(show);widget.setVisible(show)
@@ -1377,8 +1430,8 @@ class Editor(QMainWindow):
         form.addRow('形式',codec)
         whole=QCheckBox('全体を書き出す');whole.setChecked(True);form.addRow('範囲',whole)
         total=total_duration(self.clips)
-        start=QDoubleSpinBox();start.setRange(0,total);start.setDecimals(2);start.setSuffix(' 秒')
-        end=QDoubleSpinBox();end.setRange(0,total);end.setDecimals(2);end.setSuffix(' 秒');end.setValue(total)
+        start=DoubleBox();start.setRange(0,total);start.setDecimals(2);start.setSuffix(' 秒')
+        end=DoubleBox();end.setRange(0,total);end.setDecimals(2);end.setSuffix(' 秒');end.setValue(total)
         selected=self.current()
         range_row=QWidget();range_layout=QHBoxLayout(range_row);range_layout.setContentsMargins(0,0,0,0)
         range_layout.addWidget(start);range_layout.addWidget(QLabel('〜'));range_layout.addWidget(end)
@@ -1387,7 +1440,7 @@ class Editor(QMainWindow):
         to_clip.setEnabled(selected is not None)
         range_layout.addWidget(to_cursor);range_layout.addWidget(to_clip)
         form.addRow('指定範囲',range_row)
-        quality=QSpinBox();quality.setRange(0,51);quality.setValue(20);quality.setToolTip('小さいほど高画質・大容量（H.264 の CRF 相当）')
+        quality=IntBox();quality.setRange(0,51);quality.setValue(20);quality.setToolTip('小さいほど高画質・大容量（H.264 の CRF 相当）')
         form.addRow('画質（CRF、小さいほど高画質）',quality)
         bitrate=QComboBox()
         for value in (128,192,256,320):bitrate.addItem(f'{value} kbps',value)
