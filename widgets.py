@@ -6,7 +6,7 @@ from pathlib import Path
 from PyQt5.QtCore import Qt, QRectF, QPointF, QPoint, QTimer, QObject, QRunnable, QThreadPool, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QApplication, QWidget, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsItem, QMenu, QScrollArea
-from core import EFFECTS, SHAPES, BLEND_MODES, BASE_W, BASE_H, total_duration, placed_size, active_visuals, static_image, animated_value, effect_preview_image, fade_factor, visual_size
+from core import EFFECTS, SHAPES, BLEND_MODES, BASE_W, BASE_H, base_for, total_duration, placed_size, active_visuals, static_image, animated_value, effect_preview_image, fade_factor, visual_size
 
 
 class WaveformSignals(QObject):
@@ -117,7 +117,8 @@ class CompositionView(QGraphicsView):
         self.scene = QGraphicsScene()
         super().__init__(self.scene)
         self.editor = editor
-        self.scene.setSceneRect(0, 0, BASE_W, BASE_H)
+        self.bw, self.bh = BASE_W, BASE_H
+        self.scene.setSceneRect(0, 0, self.bw, self.bh)
         self.scene.setBackgroundBrush(QColor('black'))
         self.setBackgroundBrush(QColor('#090d14'))
         self.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -131,6 +132,15 @@ class CompositionView(QGraphicsView):
         self.show_grid = False
         self.grid_size = 80
 
+    def set_base(self, size):
+        if size == (self.bw, self.bh):
+            return
+        self.bw, self.bh = size
+        self.scene.setSceneRect(0, 0, self.bw, self.bh)
+        self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        self.static_cache.clear()
+        self.viewport().update()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
@@ -139,30 +149,30 @@ class CompositionView(QGraphicsView):
         # Mask the letterbox area so off-canvas objects match the exported crop.
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
         bars = [QRectF(visible.left(), visible.top(), max(0, -visible.left()), visible.height()),
-                QRectF(BASE_W, visible.top(), max(0, visible.right()-BASE_W), visible.height()),
-                QRectF(0, visible.top(), BASE_W, max(0, -visible.top())),
-                QRectF(0, BASE_H, BASE_W, max(0, visible.bottom()-BASE_H))]
+                QRectF(self.bw, visible.top(), max(0, visible.right()-self.bw), visible.height()),
+                QRectF(0, visible.top(), self.bw, max(0, -visible.top())),
+                QRectF(0, self.bh, self.bw, max(0, visible.bottom()-self.bh))]
         for bar in bars:
             painter.fillRect(bar, QColor('#090d14'))
         pen = QPen(QColor('#324157'), 1)
         pen.setCosmetic(True)
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
-        painter.drawRect(QRectF(0, 0, BASE_W, BASE_H))
+        painter.drawRect(QRectF(0, 0, self.bw, self.bh))
         if self.show_grid:
             grid = QPen(QColor(140, 190, 255, 70), 1)
             grid.setCosmetic(True)
             painter.setPen(grid)
             step = max(8, int(self.grid_size))
-            for x in range(step, BASE_W, step):
-                painter.drawLine(x, 0, x, BASE_H)
-            for y in range(step, BASE_H, step):
-                painter.drawLine(0, y, BASE_W, y)
+            for x in range(step, self.bw, step):
+                painter.drawLine(x, 0, x, self.bh)
+            for y in range(step, self.bh, step):
+                painter.drawLine(0, y, self.bw, y)
             centre = QPen(QColor(255, 190, 110, 120), 1)
             centre.setCosmetic(True)
             painter.setPen(centre)
-            painter.drawLine(BASE_W//2, 0, BASE_W//2, BASE_H)
-            painter.drawLine(0, BASE_H//2, BASE_W, BASE_H//2)
+            painter.drawLine(self.bw//2, 0, self.bw//2, self.bh)
+            painter.drawLine(0, self.bh//2, self.bw, self.bh//2)
 
     def sync(self):
         clips = active_visuals(self.editor.clips, self.editor.position, self.editor.hidden_layers)
@@ -184,7 +194,7 @@ class CompositionView(QGraphicsView):
                     shown = path
                     if c.effects:
                         try:
-                            shown = effect_preview_image(c, path, self.editor.temp.name, source_w/max(1.0, placed_size(c, self.editor.temp.name)[0]/c.scale))
+                            shown = effect_preview_image(c, path, self.editor.temp.name, source_w/max(1.0, placed_size(c, self.editor.temp.name, self.editor.base, self.editor.native)[0]/c.scale))
                         except Exception:
                             shown = path
                     self.static_cache[c.uid]=(cache_key,QPixmap(shown),source_w)
@@ -193,7 +203,7 @@ class CompositionView(QGraphicsView):
                 cached = self.editor.frame_cache[c.uid]
                 self.set_frame(c.uid, cached[1], cached[2] if len(cached) > 2 else None)
             else:
-                w, h = placed_size(c, self.editor.temp.name)
+                w, h = placed_size(c, self.editor.temp.name, self.editor.base, self.editor.native)
                 pixmap = QPixmap(max(2, int(w)), max(2, int(h)))
                 pixmap.fill(QColor('#1a2636'))
                 self.set_frame(c.uid, pixmap)
@@ -213,7 +223,7 @@ class CompositionView(QGraphicsView):
             return
         item.setPixmap(pixmap)
         item.setOffset(-pixmap.width()/2, -pixmap.height()/2)
-        width, _ = placed_size(clip, self.editor.temp.name)
+        width, _ = placed_size(clip, self.editor.temp.name, self.editor.base, self.editor.native)
         item.setScale(width/(reference_width or pixmap.width())*animated_value(clip,'scale',self.editor.position)/clip.scale)
         item.setOpacity(animated_value(clip,'opacity',self.editor.position)*fade_factor(clip,self.editor.position))
         item.setRotation(animated_value(clip,'rotation',self.editor.position))
@@ -241,6 +251,8 @@ class CompositionView(QGraphicsView):
 
 class Timeline(QWidget):
     LEFT, TOP, ROW = 105, 35, 58
+    EDGE = 14      # px of a clip's end that resizes it
+    GRAB = 7       # extra px outside the clip that still grab its edge
 
     def __init__(self, editor):
         super().__init__()
@@ -427,6 +439,10 @@ class Timeline(QWidget):
                                 amplitude=peaks[peak_index]*half_height
                                 p.drawLine(x,int(baseline-amplitude),x,int(baseline+amplitude))
                         p.restore()
+            if selected and rect.width()>=10:
+                p.setPen(Qt.NoPen);p.setBrush(QColor(200,225,255,170))
+                for hx in (rect.left()+1,rect.right()-4):
+                    p.drawRoundedRect(QRectF(hx,rect.top()+rect.height()/2-9,3,18),1.5,1.5)
             p.save()
             p.setClipRect(rect.adjusted(5, 2, -4, -2))
             p.setPen(QColor('#eef4ff'))
@@ -464,7 +480,7 @@ class Timeline(QWidget):
         for clip in reversed(sorted(self.editor.clips,key=lambda c:(c.layer,self.editor.clips.index(c)))):
             row=clip.layer
             rect=QRectF(self.LEFT+clip.offset*self.scale,self.TOP+row*self.ROW+5,max(5,clip.duration*self.scale),self.ROW-10)
-            if rect.adjusted(-1,-1,1,1).contains(position):
+            if rect.adjusted(-self.GRAB,-1,self.GRAB,1).contains(position):
                 return rect,clip
         return None
 
@@ -603,9 +619,9 @@ class Timeline(QWidget):
             point_index=min(range(len(c.keyframes)),key=lambda i:abs(self.LEFT+(c.offset+float(c.keyframes[i]['time']))*self.scale-event.pos().x()),default=None)
             point_x=self.LEFT+(c.offset+float(c.keyframes[point_index]['time']))*self.scale if point_index is not None else None
             if point_index is not None and abs(point_x-event.pos().x())<=8:mode='keyframe'
-            elif rect.width()<24:mode='move'
+            elif rect.width()<10:mode='move'
             else:
-                edge_zone=min(8.0,rect.width()/3)
+                edge_zone=min(float(self.EDGE),rect.width()/3)
                 mode='left' if event.pos().x()-rect.left()<edge_zone else 'right' if rect.right()-event.pos().x()<edge_zone else 'move'
             group=[{'uid':clip.uid,'offset':clip.offset,'layer':clip.layer} for clip in self.editor.clips if clip.uid in self.selected_uids] if mode=='move' else None
             if c.layer in self.editor.locked_layers or (group and any(item['layer'] in self.editor.locked_layers for item in group)):
@@ -638,12 +654,13 @@ class Timeline(QWidget):
             return
         dragging=bool((event.buttons()|QApplication.mouseButtons()) & (Qt.LeftButton|Qt.RightButton))
         if not dragging:
-            hit=next(((rect,self.editor.by_id(uid)) for rect,uid in reversed(self.boxes) if rect.adjusted(-8,0,8,0).contains(event.pos())),None)
+            hit=next(((rect,self.editor.by_id(uid)) for rect,uid in reversed(self.boxes) if rect.adjusted(-self.GRAB,0,self.GRAB,0).contains(event.pos())),None)
             resize=False
             move=bool(hit)
             if hit:
                 rect,clip=hit
-                resize=rect.width()>=24 and (event.pos().x()-rect.left()<min(8.0,rect.width()/3) or rect.right()-event.pos().x()<min(8.0,rect.width()/3))
+                zone=min(float(self.EDGE),rect.width()/3)
+                resize=rect.width()>=10 and (event.pos().x()-rect.left()<zone or rect.right()-event.pos().x()<zone)
                 if clip:resize=resize or any(abs(self.LEFT+(clip.offset+float(point['time']))*self.scale-event.pos().x())<=8 for point in clip.keyframes)
             self.resize_lock=resize
             self.setCursor(Qt.SizeHorCursor if resize else Qt.SizeAllCursor if move else Qt.ArrowCursor)

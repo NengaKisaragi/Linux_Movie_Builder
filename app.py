@@ -12,7 +12,7 @@ import uuid
 from PyQt5.QtCore import Qt, QTimer, QProcess, QSettings, QUrl, QEvent
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap, QKeySequence, QDesktopServices, QIcon
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QDockWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QAbstractItemView, QFormLayout, QDoubleSpinBox, QComboBox, QFileDialog, QMessageBox, QAction, QScrollArea, QSlider, QProgressBar, QShortcut, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QInputDialog, QColorDialog, QDialog, QDialogButtonBox, QSpinBox, QCheckBox)
-from core import Clip, probe, total_duration, save_project, load_project, render_command, active_visuals, animated_value, video_stream_command, audio_stream_command, font_families, EFFECTS, BLEND_MODES, SHAPES, CODECS, new_effect, effects_graph, placed_size, frame_command
+from core import MissingMedia, Clip, probe, total_duration, save_project, load_project, render_command, active_visuals, animated_value, video_stream_command, audio_stream_command, font_families, EFFECTS, BLEND_MODES, SHAPES, CODECS, new_effect, effects_graph, placed_size, frame_command, base_for, preview_size
 from widgets import Timeline, CompositionView
 
 STYLE = '''
@@ -62,6 +62,7 @@ class Editor(QMainWindow):
         self.selected_segment = 0
         self.output_resolution, self.output_fps = '1920x1080', 60
         self.hidden_layers, self.locked_layers = set(), set()
+        self.media_native = True
         self.effect_index = 0
         self.effect_ui_key = None
         self.history, self.future = [], []
@@ -108,6 +109,8 @@ class Editor(QMainWindow):
             self.layout_timer.timeout.connect(self.reset_to_default_layout)
             self.layout_timer.start(100)
         QApplication.instance().installEventFilter(self)
+        if restore_layout and geometry and state and any(self.config.value(f'dock/{d.objectName()}/floating',False,type=bool) for d in self.docks()):
+            QTimer.singleShot(0,self.restore_floating_docks)
         self.refresh()
 
     def dock(self, name, title, widget, area):
@@ -152,7 +155,7 @@ class Editor(QMainWindow):
     def build_preview(self):
         box = QWidget()
         layout = QVBoxLayout(box)
-        self.image = QLabel('プレビュー待機中\nSpace または ▶ で再生します')
+        self.image = QLabel(self.idle_text())
         self.image.setAlignment(Qt.AlignCenter)
         self.image.setMinimumSize(240, 135)
         self.image.setStyleSheet('background:#090c12; color:#8190a6; border-radius:6px;')
@@ -502,6 +505,7 @@ class Editor(QMainWindow):
         fps.addItem('値を指定…','custom')
         custom_fps=QSpinBox();custom_fps.setRange(1,240);custom_fps.setSuffix(' fps')
         form.addRow('フレームレート',fps);form.addRow('指定フレームレート',custom_fps)
+        native=QCheckBox('素材を元のピクセルサイズで配置する（AviUtl方式。画面より大きい素材ははみ出します）');native.setChecked(self.media_native);layout.addWidget(native)
         parts=self.output_resolution.split('x')
         try:current_w,current_h=map(int,parts)
         except (ValueError,TypeError):current_w,current_h=1920,1080
@@ -523,7 +527,7 @@ class Editor(QMainWindow):
                 QMessageBox.warning(self,'設定エラー','解像度の幅と高さは偶数で指定してください。');return
             selected_resolution=f'{width.value()}x{height.value()}'
         if selected_fps=='custom':selected_fps=custom_fps.value()
-        self.output_resolution=str(selected_resolution);self.output_fps=int(selected_fps)
+        self.output_resolution=str(selected_resolution);self.output_fps=int(selected_fps);self.media_native=native.isChecked()
         self.settings_changed()
         self.statusBar().showMessage(f'動画設定: {self.output_resolution} / {self.output_fps} fps',5000)
 
@@ -538,6 +542,29 @@ class Editor(QMainWindow):
         if dialog.exec_()==QDialog.Accepted:
             self.config.setValue('restore_layout',restore.isChecked())
 
+
+    def save_dock_layout(self):
+        for dock in self.docks():
+            name=dock.objectName()
+            self.config.setValue(f'dock/{name}/floating',dock.isFloating())
+            if dock.isFloating():
+                self.config.setValue(f'dock/{name}/rect',dock.geometry())
+        self.config.setValue('geometry',self.saveGeometry())
+        self.config.setValue('state',self.saveState())
+        self.config.sync()
+
+    def restore_floating_docks(self):
+        screen=QApplication.primaryScreen().availableGeometry()
+        for dock in self.docks():
+            name=dock.objectName()
+            if not self.config.value(f'dock/{name}/floating',False,type=bool):
+                continue
+            rect=self.config.value(f'dock/{name}/rect')
+            dock.setFloating(True)
+            dock.setWindowTitle('Linux Movie Builder — '+dock.windowTitle().split(' — ')[-1])
+            if rect is not None and rect.isValid() and rect.intersects(screen):
+                dock.setGeometry(rect)
+            dock.show()
 
     def set_grid(self,value):
         self.canvas.show_grid=bool(value);self.canvas.viewport().update()
@@ -557,19 +584,21 @@ class Editor(QMainWindow):
         self.stop_playback();self.checkpoint()
         c=Clip('', 'shape', 86400, duration=5, width=240, height=240, color='#4da3ff', shape_type=shape_type if shape_type in SHAPES else 'rect',
                offset=self.position if offset is None else offset, layer=1 if layer is None else max(0,min(15,layer)))
+        self.centre(c)
         self.clips.append(c);self.selected,self.position=c.uid,c.offset
         self.changed()
 
     def save_frame_dialog(self):
         if not self.clips:
             self.statusBar().showMessage('素材を追加してください',4000);return
-        path,_=QFileDialog.getSaveFileName(self,'現在のフレームを画像で保存',f'frame-{self.position:.2f}s.png','PNG (*.png)')
+        path,_=QFileDialog.getSaveFileName(self,'現在のフレームを画像で保存',str(Path(self.start_dir('export'))/f'frame-{self.position:.2f}s.png'),'PNG (*.png)')
         if not path:return
+        self.remember_dir('export', path)
         if not path.lower().endswith('.png'):path+='.png'
         self.stop_playback()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            args=frame_command(copy.deepcopy(self.clips),self.position,path,self.output_resolution,self.output_fps,self.temp.name,self.hidden_layers)
+            args=frame_command(copy.deepcopy(self.clips),self.position,path,self.output_resolution,self.output_fps,self.temp.name,self.hidden_layers,self.media_native)
             result=subprocess.run(args,capture_output=True,text=True,timeout=120)
             if result.returncode!=0:raise RuntimeError(result.stderr[-1500:])
             self.statusBar().showMessage(f'画像を保存しました: {path}',5000)
@@ -615,10 +644,9 @@ class Editor(QMainWindow):
     def reset_window_layout(self):
         self.config.remove('geometry')
         self.config.remove('state')
+        self.config.remove('dock')
         self.reset_to_default_layout()
-        self.config.setValue('geometry',self.saveGeometry())
-        self.config.setValue('state',self.saveState())
-        self.config.sync()
+        self.save_dock_layout()
         self.statusBar().showMessage('ウインドウ配置を初期状態に戻しました',4000)
 
     def join_windows(self):
@@ -636,11 +664,49 @@ class Editor(QMainWindow):
         height=max(360,min(850,screen.height()-80))
         self.resize(width,height)
 
+    def remember_dir(self, kind, path):
+        """kind: 'project', 'media' or 'export'. Stores the folder of `path` for the next dialog."""
+        try:
+            folder = Path(path)
+            folder = folder if folder.is_dir() else folder.parent
+            if folder.is_dir():
+                self.config.setValue(f'dir/{kind}', str(folder))
+        except (OSError, TypeError):
+            pass
+
+    def start_dir(self, kind):
+        """First existing folder from the most relevant places for this kind of dialog."""
+        project = str(Path(self.project).parent) if self.project else None
+        saved = lambda key: self.config.value(f'dir/{key}', None)
+        order = {'project': [project, saved('project'), saved('media'), saved('export')],
+                 'media': [saved('media'), project, saved('project')],
+                 'export': [saved('export'), project, saved('project'), saved('media')]}[kind]
+        for folder in order:
+            if folder and Path(str(folder)).is_dir():
+                return str(folder)
+        return str(Path.home())
+
+    def default_name(self, extension):
+        return (Path(self.project).stem if self.project else 'movie')+extension
+
+    @property
+    def base(self):
+        return base_for(self.output_resolution)
+
+    @property
+    def native(self):
+        """Output height when media is placed at native pixel size, else None."""
+        try:return int(self.output_resolution.split('x')[1]) if self.media_native else None
+        except (ValueError,IndexError):return None
+
+    def centre(self, clip):
+        clip.x, clip.y = self.base[0]/2, self.base[1]/2
+
     def current(self):
         return next((c for c in self.clips if c.uid == self.selected), None)
 
     def settings(self):
-        return {'resolution': self.output_resolution, 'fps': self.output_fps, 'hidden_layers': sorted(self.hidden_layers), 'locked_layers': sorted(self.locked_layers)}
+        return {'resolution': self.output_resolution, 'fps': self.output_fps, 'hidden_layers': sorted(self.hidden_layers), 'locked_layers': sorted(self.locked_layers), 'media_scale': 'native' if self.media_native else 'fit'}
 
     def checkpoint(self):
         self.history.append(copy.deepcopy((self.clips, self.settings())))
@@ -650,7 +716,15 @@ class Editor(QMainWindow):
     def settings_changed(self):
         if not self.loading:
             self.dirty = True
-            self.update_title()
+            self.stop_playback()
+            self.playback_frame = None
+            self.image.setPixmap(QPixmap())
+            self.frame_cache.clear()
+            self.refresh()
+            self.request_edit_frame()
+
+    def idle_text(self):
+        return f'プレビュー待機中（{self.output_resolution} / {self.output_fps} fps）\nSpace または ▶ で再生します'
 
     def changed(self):
         self.stop_playback()
@@ -663,6 +737,8 @@ class Editor(QMainWindow):
 
     def refresh(self):
         self.loading = True
+        self.canvas.set_base(self.base)
+        if self.playback is None and (self.image.pixmap() is None or self.image.pixmap().isNull()):self.image.setText(self.idle_text())
         if hasattr(self, 'timeline'):
             valid={c.uid for c in self.clips}
             self.timeline.selected_uids.intersection_update(valid)
@@ -1040,7 +1116,7 @@ class Editor(QMainWindow):
                 continue
             fit = min(960/c.width, 540/c.height)
             frame_w = max(2, round(c.width*fit))
-            graph = '[0:v]scale=960:540:force_original_aspect_ratio=decrease,format=rgba[e0];'+';'.join(effects_graph(c.effects, 'e0', 'eout', 'p', frame_w/max(1.0, placed_size(c, self.temp.name)[0]/c.scale)))
+            graph = '[0:v]scale=960:540:force_original_aspect_ratio=decrease,format=rgba[e0];'+';'.join(effects_graph(c.effects, 'e0', 'eout', 'p', frame_w/max(1.0, placed_size(c, self.temp.name, self.base, self.native)[0]/c.scale)))
             process = QProcess(self)
             self.frame_processes[c.uid] = (process, source_time)
             process.finished.connect(lambda code, status, uid=c.uid, p=process, t=source_time, w=frame_w, k=fx_key: self.frame_done(uid, p, t, code, w, k))
@@ -1068,8 +1144,17 @@ class Editor(QMainWindow):
 
     def import_files(self, paths=None, offset=None, layer=None, point=None):
         if not isinstance(paths, list):
-            paths, _ = QFileDialog.getOpenFileNames(self, '動画・画像・音声を追加', '', 'メディア (*.mp4 *.mkv *.mov *.avi *.webm *.m4v *.mpg *.mpeg *.mts *.mp3 *.wav *.ogg *.flac *.m4a *.aac *.opus *.png *.jpg *.jpeg *.webp *.bmp *.tiff *.txt);;すべて (*)')
+            paths, _ = QFileDialog.getOpenFileNames(self, '動画・画像・音声を追加', self.start_dir('media'), 'メディア (*.mp4 *.mkv *.mov *.avi *.webm *.m4v *.mpg *.mpeg *.mts *.mp3 *.wav *.ogg *.flac *.m4a *.aac *.opus *.png *.jpg *.jpeg *.webp *.bmp *.tiff *.txt);;すべて (*)')
         if not paths:
+            return
+        projects = [path for path in paths if str(path).lower().endswith('.lmb')]
+        media = [path for path in paths if not str(path).lower().endswith('.lmb')]
+        if media:
+            self.remember_dir('media', media[0])
+        if projects:
+            # A dropped project replaces the current one instead of being read as media.
+            if self.may_discard():
+                self.load_path(projects[0])
             return
         self.stop_playback()
         self.checkpoint()
@@ -1085,6 +1170,7 @@ class Editor(QMainWindow):
                     else:
                         c = probe(path)
                         c.layer = 1 if c.kind == 'image' else 0
+                    self.centre(c)
                     if layer is not None:
                         c.layer = min(15, layer)
                     if cursor is not None:
@@ -1169,6 +1255,7 @@ class Editor(QMainWindow):
         self.output_fps=int(settings['fps'])
         self.hidden_layers=set(settings.get('hidden_layers',[]))
         self.locked_layers=set(settings.get('locked_layers',[]))
+        self.media_native=settings.get('media_scale','native')=='native'
         self.loading = False
         self.changed()
 
@@ -1202,11 +1289,12 @@ class Editor(QMainWindow):
             self.frame_cache.clear()
             self.playback_frame=None
             self.image.setPixmap(QPixmap())
-            self.image.setText('プレビュー待機中\nSpace または ▶ で再生します')
+            self.image.setText(self.idle_text())
             self.clips, self.history, self.future = [], [], []
             self.selected, self.project, self.position, self.dirty = None, None, 0, False
             self.output_resolution,self.output_fps='1920x1080',60
             self.hidden_layers,self.locked_layers=set(),set()
+            self.media_native=True
             self.refresh()
 
     def save(self, save_as=False):
@@ -1214,13 +1302,14 @@ class Editor(QMainWindow):
             self.apply_text()
         path = self.project
         if save_as or not path:
-            path, _ = QFileDialog.getSaveFileName(self, 'プロジェクトを保存', path or '無題.lmb', 'Linux Movie Builder (*.lmb)')
+            path, _ = QFileDialog.getSaveFileName(self, 'プロジェクトを保存', path or str(Path(self.start_dir('project'))/'無題.lmb'), 'Linux Movie Builder (*.lmb)')
         if not path:
             return False
         if not path.endswith('.lmb'):
             path += '.lmb'
         try:
             save_project(path, self.clips, self.settings())
+            self.remember_dir('project', path)
             self.project, self.dirty = path, False
             self.update_title()
             self.statusBar().showMessage('プロジェクトを保存しました', 5000)
@@ -1232,20 +1321,33 @@ class Editor(QMainWindow):
     def open(self):
         if not self.may_discard():
             return
-        path, _ = QFileDialog.getOpenFileName(self, 'プロジェクトを開く', '', 'Linux Movie Builder (*.lmb)')
-        if not path:
-            return
+        path, _ = QFileDialog.getOpenFileName(self, 'プロジェクトを開く', self.start_dir('project'), 'Linux Movie Builder (*.lmb)')
+        if path:
+            self.load_path(path)
+
+    def load_path(self, path, search_dirs=()):
+        relinked = []
         try:
-            clips, settings = load_project(path)
+            clips, settings = load_project(path, search_dirs, relinked)
+            self.remember_dir('project', path)
             self.clear_edit_decoders()
             self.frame_cache.clear()
             self.playback_frame=None
             self.image.setPixmap(QPixmap())
-            self.image.setText('プレビュー待機中\nSpace または ▶ で再生します')
+            self.image.setText(self.idle_text())
             self.restore_snapshot((clips, settings))
             self.history, self.future = [], []
-            self.selected, self.position, self.project, self.dirty = None, 0, path, False
+            self.selected, self.position, self.project, self.dirty = None, 0, path, bool(relinked)
             self.refresh()
+            if relinked:
+                self.statusBar().showMessage(f'{len(relinked)} 個の素材を別の場所から見つけました。保存すると新しい場所を記憶します', 8000)
+        except MissingMedia as e:
+            names = '\n'.join(e.names[:8])+('\n…' if len(e.names) > 8 else '')
+            answer = QMessageBox.question(self, '素材が見つかりません', f'次の素材が見つかりません:\n{names}\n\n素材のあるフォルダを選んで探しますか？（サブフォルダも探します）', QMessageBox.Yes | QMessageBox.No)
+            if answer == QMessageBox.Yes:
+                folder = QFileDialog.getExistingDirectory(self, '素材のあるフォルダを選択', self.start_dir('media'))
+                if folder:
+                    self.load_path(path, (*search_dirs, folder))
         except Exception as e:
             QMessageBox.warning(self, '読み込みエラー', str(e))
 
@@ -1257,8 +1359,9 @@ class Editor(QMainWindow):
         if options is None:
             return
         ext = CODECS[options['codec']]['ext']
-        path, _ = QFileDialog.getSaveFileName(self, '書き出し', 'movie'+ext, f'{CODECS[options["codec"]]["name"]} (*{ext})')
+        path, _ = QFileDialog.getSaveFileName(self, '書き出し', str(Path(self.start_dir('export'))/self.default_name(ext)), f'{CODECS[options["codec"]]["name"]} (*{ext})')
         if path:
+            self.remember_dir('export', path)
             if not path.lower().endswith(ext):
                 path += ext
             if any(c.path and Path(c.path).resolve() == Path(path).resolve() for c in self.clips):
@@ -1332,7 +1435,7 @@ class Editor(QMainWindow):
             os.close(fd)
             args = render_command(copy.deepcopy(self.clips), staged, self.output_resolution, self.output_fps, asset_dir=self.temp.name,
                                   start=options.get('start',0.0), end=options.get('end'), codec=options.get('codec','h264'),
-                                  crf=options.get('crf'), audio_bitrate=options.get('audio_bitrate',192), hidden_layers=self.hidden_layers)
+                                  crf=options.get('crf'), audio_bitrate=options.get('audio_bitrate',192), hidden_layers=self.hidden_layers, native_media=self.media_native)
         except Exception as e:
             if staged:
                 Path(staged).unlink(missing_ok=True)
@@ -1408,11 +1511,12 @@ class Editor(QMainWindow):
         self.frame_timer.stop()
         snapshot = copy.deepcopy(self.clips)
         try:
-            video_args = video_stream_command(snapshot, self.position, self.temp.name, hardware_decode=self.playback_hwaccel, hidden_layers=self.hidden_layers)
-            audio_args = audio_stream_command(snapshot, self.position, self.temp.name, hidden_layers=self.hidden_layers)
+            video_args = video_stream_command(snapshot, self.position, self.temp.name, hardware_decode=self.playback_hwaccel, hidden_layers=self.hidden_layers, resolution=self.output_resolution, native_media=self.media_native)
+            audio_args = audio_stream_command(snapshot, self.position, self.temp.name, hidden_layers=self.hidden_layers, resolution=self.output_resolution)
         except Exception as e:
             QMessageBox.warning(self, '再生エラー', str(e))
             return
+        self.playback_size = preview_size(self.output_resolution)
         self.playback_start = self.position
         self.playback_frames = 0
         self.playback_buffer = bytearray()
@@ -1447,7 +1551,8 @@ class Editor(QMainWindow):
         if not self.playback:
             return
         from PyQt5.QtGui import QImage
-        size = 800*450*3
+        pw, ph = self.playback_size
+        size = pw*ph*3
         if self.playback_wall_start is None and len(self.playback_buffer) >= size:
             self.playback_wall_start = time.monotonic()
         frame = None
@@ -1458,7 +1563,7 @@ class Editor(QMainWindow):
                 del self.playback_buffer[:size]
                 self.playback_frames += 1
         if frame is not None:
-            image = QImage(frame, 800, 450, 800*3, QImage.Format_RGB888).copy()
+            image = QImage(frame, pw, ph, pw*3, QImage.Format_RGB888).copy()
             preview_pixmap=QPixmap.fromImage(image)
             self.show_frame(preview_pixmap)
             self.playback_frame=preview_pixmap
@@ -1510,7 +1615,7 @@ class Editor(QMainWindow):
         if was_playing:
             if self.playback_frame is None:
                 self.image.setPixmap(QPixmap())
-                self.image.setText('プレビュー待機中\nSpace または ▶ で再生します')
+                self.image.setText(self.idle_text())
             self.statusBar().showMessage('停止中')
 
     def clear_edit_decoders(self):
@@ -1536,6 +1641,7 @@ class Editor(QMainWindow):
         self.stop_playback()
         self.checkpoint()
         c = Clip('', 'text', 86400, duration=5, text=text[:4000], offset=self.position if offset is None else offset, layer=2 if layer is None else layer)
+        self.centre(c)
         if point:
             c.x, c.y = point
         self.clips.append(c)
@@ -1662,8 +1768,7 @@ class Editor(QMainWindow):
             return
         self.stop_playback()
         self.frame_timer.stop()
-        self.config.setValue('geometry', self.saveGeometry())
-        self.config.setValue('state', self.saveState())
+        self.save_dock_layout()
         for process, t in self.frame_processes.values():
             process.blockSignals(True)
             process.kill()
@@ -1683,6 +1788,9 @@ def main():
     app.setStyleSheet(STYLE)
     editor = Editor()
     editor.show()
+    argument = next((a for a in sys.argv[1:] if a.lower().endswith('.lmb') and Path(a).is_file()), None)
+    if argument:
+        QTimer.singleShot(0, lambda: editor.load_path(str(Path(argument).resolve())))
     sys.exit(app.exec_())
 
 

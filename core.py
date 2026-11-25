@@ -12,6 +12,22 @@ from functools import lru_cache
 from PIL import Image, ImageDraw, ImageFont
 
 BASE_W, BASE_H = 1280, 720
+
+
+def base_for(resolution):
+    """Editing canvas for an output size: height stays 720, width follows the aspect ratio."""
+    try:
+        w, h = map(int, str(resolution).split('x'))
+        return max(2, round(BASE_H*w/h)), BASE_H
+    except (ValueError, ZeroDivisionError):
+        return BASE_W, BASE_H
+
+
+def preview_size(resolution):
+    """Even-sized live-preview frame (height 450) with the output aspect ratio."""
+    bw, bh = base_for(resolution)
+    w = max(2, round(450*bw/bh/2)*2)
+    return min(w, 1600), 450
 IMAGE_EXT = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff'}
 FONT = '/usr/share/fonts/truetype/fonts-japanese-gothic.ttf'
 if not Path(FONT).is_file():
@@ -399,9 +415,13 @@ def visual_size(clip, directory=None):
     return clip.width, clip.height
 
 
-def placed_size(clip, directory=None):
+def placed_size(clip, directory=None, base=None, native=None):
+    """Size in editing units. native=output height in px places media at 1 source px = 1 output px (AviUtl style)."""
     w, h = visual_size(clip, directory)
-    fit = 1 if clip.kind in ('text','shape') else min(BASE_W/w, BASE_H/h)
+    bw, bh = base or (BASE_W, BASE_H)
+    if clip.kind in ('text','shape'):fit = 1
+    elif native:fit = bh/native
+    else:fit = min(bw/w, bh/h)
     return max(2, w*fit*clip.scale), max(2, h*fit*clip.scale)
 
 
@@ -485,6 +505,8 @@ def save_project(path, clips, settings):
     for clip in clips:
         record = asdict(clip)
         record['path'] = os.path.relpath(clip.path, base) if clip.kind not in ('text','filter','shape') else ''
+        # The absolute path is a fallback for when the project file is moved away from its media.
+        record['abs_path'] = str(Path(clip.path).resolve()) if clip.kind not in ('text','filter','shape') else ''
         records.append(record)
     data = {'application': 'Linux Movie Builder', 'version': 4, 'settings': settings, 'clips': records}
     fd, tmp = tempfile.mkstemp(dir=base, suffix='.tmp')
@@ -497,14 +519,76 @@ def save_project(path, clips, settings):
             os.unlink(tmp)
 
 
-def load_project(path):
+class MissingMedia(ValueError):
+    """Raised when media referenced by a project cannot be found anywhere we look."""
+    def __init__(self, names):
+        self.names = list(dict.fromkeys(names))
+        super().__init__('素材が見つかりません: '+', '.join(self.names))
+
+
+def _find_by_name(name, folders, depth=4):
+    for folder in folders:
+        folder = Path(folder)
+        if (folder/name).is_file():
+            return str((folder/name).resolve())
+        base_depth = len(folder.parts)
+        try:
+            for root, dirs, files in os.walk(folder):
+                if len(Path(root).parts)-base_depth >= depth:
+                    dirs[:] = []
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                if name in files:
+                    return str((Path(root)/name).resolve())
+        except OSError:
+            continue
+    return None
+
+
+def locate_media(record, project_dir, search_dirs=()):
+    """Relative path, then stored absolute path, then the same file name near the project or in search_dirs."""
+    relative = (Path(project_dir)/record['path']).resolve() if record.get('path') else None
+    if relative and relative.is_file():
+        return str(relative), False
+    absolute = record.get('abs_path')
+    if absolute and Path(absolute).is_file():
+        return str(Path(absolute).resolve()), True
+    names = [n for n in (Path(record.get('abs_path') or '').name, Path(record.get('path') or '').name) if n]
+    project_dir = Path(project_dir)
+    # Nearby places first: user-chosen folders, the project folder, then folders around where the media used to be.
+    nearby = [*search_dirs, project_dir]
+    for original in (Path(record['abs_path']).parent if record.get('abs_path') else None, relative.parent if relative else None):
+        if original is None:
+            continue
+        for ancestor in [original, *list(original.parents)[:1]]:
+            if len(ancestor.parts) > 3 and ancestor.is_dir():  # never sweep /, /media or a whole home folder
+                nearby.append(ancestor)
+    if len(project_dir.parts) > 3:
+        nearby.append(project_dir.parent)
+    nearby = list(dict.fromkeys(str(d) for d in nearby))
+    for name in dict.fromkeys(names):
+        found = _find_by_name(name, nearby[:len(search_dirs)+1], depth=4) or _find_by_name(name, nearby[len(search_dirs)+1:], depth=3)
+        if found:
+            return found, True
+    return (str(relative) if relative else ''), None
+
+
+def load_project(path, search_dirs=(), relinked=None):
     data = json.loads(Path(path).read_text(encoding='utf-8'))
     if data.get('application') != 'Linux Movie Builder' or data.get('version') not in (1, 2, 3, 4):
         raise ValueError('対応するプロジェクトファイルではありません')
     clips, elapsed = [], 0.0
+    missing = []
     for record in data['clips']:
         if record['kind'] not in ('text','filter','shape'):
-            record['path'] = str((Path(path).resolve().parent/record['path']).resolve())
+            located, moved = locate_media(record, Path(path).resolve().parent, search_dirs)
+            if moved is None:
+                missing.append(Path(record.get('abs_path') or record['path']).name)
+            elif moved and relinked is not None:
+                relinked.append(located)
+            record['path'] = located
+    if missing:
+        raise MissingMedia(missing)
+    for record in data['clips']:
         if data['version'] == 1:
             if record['kind'] != 'audio':
                 record['offset'] = elapsed
@@ -527,7 +611,8 @@ def load_project(path):
     if not 2<=width<=16384 or not 2<=height<=16384 or width%2 or height%2 or not 1<=fps<=240:
         raise ValueError('出力設定が無効です')
     layers=lambda key:sorted({int(v) for v in settings.get(key,[]) if isinstance(v,int) and 0<=v<=15})
-    settings={'resolution':f'{width}x{height}','fps':fps,'hidden_layers':layers('hidden_layers'),'locked_layers':layers('locked_layers')}
+    # Projects saved before v1.10 fitted media inside the frame; keep them looking the same.
+    settings={'resolution':f'{width}x{height}','fps':fps,'hidden_layers':layers('hidden_layers'),'locked_layers':layers('locked_layers'),'media_scale':settings.get('media_scale','fit') if settings.get('media_scale') in ('fit','native') else 'fit'}
     return clips, settings
 
 
@@ -593,7 +678,7 @@ def _expr(clip, key, base, time='t'):
     return result
 
 
-def composition(clips, resolution, fps, directory, position=0, realtime=False, video=True, audio=True, hardware_decode=False, end=None, hidden_layers=()):
+def composition(clips, resolution, fps, directory, position=0, realtime=False, video=True, audio=True, hardware_decode=False, end=None, hidden_layers=(), native_media=False):
     """One composition graph used by export and streaming, seeking inputs directly."""
     validate(clips)
     clips=[c for c in clips if c.layer not in set(hidden_layers)]
@@ -606,7 +691,11 @@ def composition(clips, resolution, fps, directory, position=0, realtime=False, v
     duration = finish-position
     if duration <= 0:
         raise ValueError('終端です。再生位置を前に戻してください')
-    factor = width/BASE_W
+    base_w, base_h = base_for(resolution)
+    factor = height/base_h
+    # native_media: True = relative to this render's height, or an int = the project's output height
+    # (live preview renders smaller frames, but must place media exactly like the export).
+    native_h = native_media if isinstance(native_media, int) and not isinstance(native_media, bool) else (height if native_media else None)
     args = ['ffmpeg', '-hide_banner', '-nostdin', '-filter_complex_threads', '1', '-threads', '2']
     filters, audio_tracks = [], []
     next_input = 0
@@ -682,8 +771,8 @@ def composition(clips, resolution, fps, directory, position=0, realtime=False, v
             args += ['-threads', '2', '-t', f'{source_len+.05:.6f}', '-i', path]
             when = f't+{position:.9g}'
             if use_video:
-                w, h = placed_size(c, directory)
-                w, h = max(2, round(w/c.scale*width/BASE_W)), max(2, round(h/c.scale*height/BASE_H))
+                w, h = placed_size(c, directory, (base_w, base_h), native_h)
+                w, h = max(2, round(w/c.scale*width/base_w)), max(2, round(h/c.scale*height/base_h))
                 sx = _expr(c, 'scale', c.scale, time=when)
                 xx = _expr(c, 'x', c.x, time=when)
                 yy = _expr(c, 'y', c.y, time=when)
@@ -707,8 +796,8 @@ def composition(clips, resolution, fps, directory, position=0, realtime=False, v
                 if c.opacity!=1 or c.animation.get('opacity',{}).get('mode','none')!='none' or c.fade_in>0 or c.fade_out>0:
                     post.append(f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='alpha(X,Y)*({alpha})'")
                 filters.append(f"[{current}]{','.join(post) or 'null'}[layer{visual_index}]")
-                x = f"(({xx})*main_w/{BASE_W}-overlay_w/2)"
-                y = f"(({yy})*main_h/{BASE_H}-overlay_h/2)"
+                x = f"(({xx})*main_w/{base_w}-overlay_w/2)"
+                y = f"(({yy})*main_h/{base_h}-overlay_h/2)"
                 overlay=f"overlay=x='{x}':y='{y}':eof_action=pass:repeatlast=0:enable='between(t\\,{delay:.6f}\\,{delay+remaining:.6f})'"
                 n=visual_index
                 if c.blend=='normal':
@@ -754,10 +843,10 @@ CODECS={
 }
 
 
-def render_command(clips, output, resolution='1920x1080', fps=60, preview=False, asset_dir=None, start=0.0, end=None, codec='h264', crf=None, audio_bitrate=192, hidden_layers=()):
+def render_command(clips, output, resolution='1920x1080', fps=60, preview=False, asset_dir=None, start=0.0, end=None, codec='h264', crf=None, audio_bitrate=192, hidden_layers=(), native_media=False):
     directory = asset_dir or str(Path(output).parent)
     audio_only = codec in ('wav','mp3')
-    args, duration = composition(clips, resolution, fps, directory, start, video=not audio_only, end=end, hidden_layers=hidden_layers)
+    args, duration = composition(clips, resolution, fps, directory, start, video=not audio_only, end=end, hidden_layers=hidden_layers, native_media=native_media)
     args += ['-y']
     if not audio_only:
         args += ['-map', '[video]']
@@ -781,19 +870,22 @@ def render_command(clips, output, resolution='1920x1080', fps=60, preview=False,
     return args
 
 
-def frame_command(clips, position, output, resolution='1920x1080', fps=60, asset_dir=None, hidden_layers=()):
+def frame_command(clips, position, output, resolution='1920x1080', fps=60, asset_dir=None, hidden_layers=(), native_media=False):
     """Write the composed frame at `position` as a PNG image."""
     directory = asset_dir or str(Path(output).parent)
     end = min(total_duration(clips), position+2/max(1,int(fps)))
-    args, _ = composition(clips, resolution, fps, directory, position, audio=False, end=end, hidden_layers=hidden_layers)
+    args, _ = composition(clips, resolution, fps, directory, position, audio=False, end=end, hidden_layers=hidden_layers, native_media=native_media)
     return args+['-y', '-map', '[video]', '-frames:v', '1', '-update', '1', '-f', 'image2', str(output)]
 
 
-def video_stream_command(clips, position, directory, hardware_decode=False, hidden_layers=()):
-    args, duration = composition(clips, '800x450', 30, directory, position, True, video=True, audio=False, hardware_decode=hardware_decode, hidden_layers=hidden_layers)
+def video_stream_command(clips, position, directory, hardware_decode=False, hidden_layers=(), resolution='1920x1080', native_media=False):
+    pw, ph = preview_size(resolution)
+    if native_media is True:
+        native_media = int(resolution.split('x')[1])
+    args, duration = composition(clips, f'{pw}x{ph}', 30, directory, position, True, video=True, audio=False, hardware_decode=hardware_decode, hidden_layers=hidden_layers, native_media=native_media)
     return args+['-map', '[video]', '-t', f'{duration:.6f}', '-pix_fmt', 'rgb24', '-threads', '1', '-f', 'rawvideo', 'pipe:1']
 
 
-def audio_stream_command(clips, position, directory, hidden_layers=()):
+def audio_stream_command(clips, position, directory, hidden_layers=(), resolution='1920x1080'):
     args, duration = composition(clips, '800x450', 30, directory, position, True, video=False, audio=True, hidden_layers=hidden_layers)
     return args+['-map', '[audio]', '-t', f'{duration:.6f}', '-ac', '2', '-ar', '48000', '-f', 's16le', 'pipe:1']

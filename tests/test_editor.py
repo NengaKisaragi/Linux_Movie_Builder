@@ -36,6 +36,10 @@ class EditorTests(unittest.TestCase):
         raw = json.loads(path.read_text())
         raw['clips'][0]['path'] = 'missing.mp4'
         path.write_text(json.dumps(raw))
+        restored, _ = load_project(path)  # the stored absolute path still finds the media
+        self.assertEqual(restored[0].path, clips[0].path)
+        raw['clips'][0]['abs_path'] = ''
+        path.write_text(json.dumps(raw))
         with self.assertRaises(ValueError):
             load_project(path)
 

@@ -89,7 +89,7 @@ class AviUtlFeatureTests(unittest.TestCase):
         out = self.render([red, blue], hidden_layers=[1])
         self.assertGreater(self.pixel(out, .5, (160, 90))[0], 240)
         path = self.root/'features.lmb'
-        settings = {'resolution': '1280x720', 'fps': 30, 'hidden_layers': [1], 'locked_layers': [0]}
+        settings = {'resolution': '1280x720', 'fps': 30, 'hidden_layers': [1], 'locked_layers': [0], 'media_scale': 'native'}
         save_project(path, [red, blue], settings)
         clips, restored = load_project(path)
         self.assertEqual(clips, [red, blue])
