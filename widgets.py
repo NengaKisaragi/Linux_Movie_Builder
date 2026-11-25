@@ -6,7 +6,7 @@ from pathlib import Path
 from PyQt5.QtCore import Qt, QRectF, QPointF, QPoint, QTimer, QObject, QRunnable, QThreadPool, pyqtSignal
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import QApplication, QWidget, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsItem, QMenu, QScrollArea
-from core import BASE_W, BASE_H, total_duration, placed_size, active_visuals, text_image, animated_value
+from core import EFFECTS, SHAPES, BLEND_MODES, BASE_W, BASE_H, total_duration, placed_size, active_visuals, static_image, animated_value, effect_preview_image, fade_factor, visual_size
 
 
 class WaveformSignals(QObject):
@@ -63,8 +63,19 @@ class VisualItem(QGraphicsPixmapItem):
         self.pressed = None
         self.saved = False
 
+    COMPOSITION = {'add':QPainter.CompositionMode_Plus,'multiply':QPainter.CompositionMode_Multiply,'screen':QPainter.CompositionMode_Screen,
+                   'overlay':QPainter.CompositionMode_Overlay,'lighten':QPainter.CompositionMode_Lighten,'darken':QPainter.CompositionMode_Darken,
+                   'difference':QPainter.CompositionMode_Difference}
+
     def paint(self, painter, option, widget=None):
+        clip = self.view.editor.by_id(self.uid)
+        mode = self.COMPOSITION.get(clip.blend if clip else 'normal')
+        if mode is not None:
+            painter.save()
+            painter.setCompositionMode(mode)
         super().paint(painter, option, widget)
+        if mode is not None:
+            painter.restore()
         if self.uid == self.view.editor.selected:
             pen = QPen(QColor('#8bc5ff'), 2)
             pen.setCosmetic(True)
@@ -73,6 +84,8 @@ class VisualItem(QGraphicsPixmapItem):
             painter.drawRect(self.boundingRect())
 
     def mousePressEvent(self, event):
+        clip = self.view.editor.by_id(self.uid)
+        self.setFlag(QGraphicsItem.ItemIsMovable, not (clip and clip.layer in self.view.editor.locked_layers))
         self.view.editor.select(self.uid)
         self.pressed, self.saved = event.scenePos(), False
         super().mousePressEvent(event)
@@ -115,6 +128,8 @@ class CompositionView(QGraphicsView):
         self.setAcceptDrops(True)
         self.items_by_id = {}
         self.static_cache = {}
+        self.show_grid = False
+        self.grid_size = 80
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -134,9 +149,23 @@ class CompositionView(QGraphicsView):
         painter.setPen(pen)
         painter.setBrush(Qt.NoBrush)
         painter.drawRect(QRectF(0, 0, BASE_W, BASE_H))
+        if self.show_grid:
+            grid = QPen(QColor(140, 190, 255, 70), 1)
+            grid.setCosmetic(True)
+            painter.setPen(grid)
+            step = max(8, int(self.grid_size))
+            for x in range(step, BASE_W, step):
+                painter.drawLine(x, 0, x, BASE_H)
+            for y in range(step, BASE_H, step):
+                painter.drawLine(0, y, BASE_W, y)
+            centre = QPen(QColor(255, 190, 110, 120), 1)
+            centre.setCosmetic(True)
+            painter.setPen(centre)
+            painter.drawLine(BASE_W//2, 0, BASE_W//2, BASE_H)
+            painter.drawLine(0, BASE_H//2, BASE_W, BASE_H//2)
 
     def sync(self):
-        clips = active_visuals(self.editor.clips, self.editor.position)
+        clips = active_visuals(self.editor.clips, self.editor.position, self.editor.hidden_layers)
         active = {c.uid for c in clips}
         for uid in list(self.items_by_id):
             if uid not in active:
@@ -147,14 +176,22 @@ class CompositionView(QGraphicsView):
                 item = VisualItem(self, c)
                 self.scene.addItem(item)
                 self.items_by_id[c.uid] = item
-            if c.kind in ('image', 'text'):
-                path = text_image(c, self.editor.temp.name) if c.kind == 'text' else c.path
-                cache_key=(c.kind,path)
-                if self.static_cache.get(c.uid,(None,None))[0] != cache_key:
-                    self.static_cache[c.uid]=(cache_key,QPixmap(path))
-                self.set_frame(c.uid,self.static_cache[c.uid][1])
+            if c.kind in ('image', 'text', 'shape'):
+                path = static_image(c, self.editor.temp.name)
+                cache_key=(c.kind,path,repr(c.effects))
+                if self.static_cache.get(c.uid,(None,))[0] != cache_key:
+                    source_w = visual_size(c, self.editor.temp.name)[0]
+                    shown = path
+                    if c.effects:
+                        try:
+                            shown = effect_preview_image(c, path, self.editor.temp.name, source_w/max(1.0, placed_size(c, self.editor.temp.name)[0]/c.scale))
+                        except Exception:
+                            shown = path
+                    self.static_cache[c.uid]=(cache_key,QPixmap(shown),source_w)
+                self.set_frame(c.uid,self.static_cache[c.uid][1],self.static_cache[c.uid][2])
             elif c.uid in self.editor.frame_cache:
-                self.set_frame(c.uid, self.editor.frame_cache[c.uid][1])
+                cached = self.editor.frame_cache[c.uid]
+                self.set_frame(c.uid, cached[1], cached[2] if len(cached) > 2 else None)
             else:
                 w, h = placed_size(c, self.editor.temp.name)
                 pixmap = QPixmap(max(2, int(w)), max(2, int(h)))
@@ -162,22 +199,23 @@ class CompositionView(QGraphicsView):
                 self.set_frame(c.uid, pixmap)
             item.setTransformOriginPoint(0,0)
             item.setPos(animated_value(c,'x',self.editor.position), animated_value(c,'y',self.editor.position))
-            item.setOpacity(animated_value(c,'opacity',self.editor.position))
+            item.setOpacity(animated_value(c,'opacity',self.editor.position)*fade_factor(c,self.editor.position))
             item.setRotation(animated_value(c,'rotation',self.editor.position))
             item.setZValue(z)
             item.setSelected(c.uid == self.editor.selected)
             item.update()
         self.viewport().update()
 
-    def set_frame(self, uid, pixmap):
+    def set_frame(self, uid, pixmap, reference_width=None):
+        """reference_width is the unpadded source width (effects such as blur enlarge the pixmap)."""
         item, clip = self.items_by_id.get(uid), self.editor.by_id(uid)
         if item is None or clip is None or pixmap.isNull():
             return
         item.setPixmap(pixmap)
         item.setOffset(-pixmap.width()/2, -pixmap.height()/2)
         width, _ = placed_size(clip, self.editor.temp.name)
-        item.setScale(width/pixmap.width()*animated_value(clip,'scale',self.editor.position)/clip.scale)
-        item.setOpacity(animated_value(clip,'opacity',self.editor.position))
+        item.setScale(width/(reference_width or pixmap.width())*animated_value(clip,'scale',self.editor.position)/clip.scale)
+        item.setOpacity(animated_value(clip,'opacity',self.editor.position)*fade_factor(clip,self.editor.position))
         item.setRotation(animated_value(clip,'rotation',self.editor.position))
 
     def select(self):
@@ -218,6 +256,7 @@ class Timeline(QWidget):
         self.resize_lock = False
         self.waveforms = {}
         self.waveform_workers = {}
+        self.snap_enabled = True
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setMinimumHeight(290)
@@ -288,6 +327,28 @@ class Timeline(QWidget):
             horizontal.setValue(round(self.LEFT+anchor_time*self.scale-viewport_x))
         event.accept()
 
+    def eye_rect(self, row):
+        return QRectF(8, self.TOP+row*self.ROW+30, 38, 18)
+
+    def lock_rect(self, row):
+        return QRectF(50, self.TOP+row*self.ROW+30, 48, 18)
+
+    def snap_points(self, exclude):
+        points = {0.0, self.editor.position}
+        for clip in self.editor.clips:
+            if clip.uid in exclude:
+                continue
+            points.add(clip.offset)
+            points.add(clip.offset+clip.duration)
+        return points
+
+    def snap(self, value, exclude, points=None):
+        if not self.snap_enabled or QApplication.keyboardModifiers() & Qt.AltModifier:
+            return value
+        threshold = 8/self.scale
+        best = min(points if points is not None else self.snap_points(exclude), key=lambda point: abs(point-value), default=None)
+        return best if best is not None and abs(best-value) <= threshold else value
+
     def time_at(self, x):
         fps = self.editor.output_fps
         return max(0, round((x-self.LEFT)/self.scale*fps)/fps)
@@ -311,14 +372,25 @@ class Timeline(QWidget):
             y = self.TOP+row*self.ROW
             p.setPen(QColor('#243044'))
             p.drawLine(0, y, self.width(), y)
-            p.setPen(QColor('#94a6be'))
-            label=f'Layer {row+1}'
-            p.drawText(10, y+29, label)
+            hidden=row in self.editor.hidden_layers
+            locked=row in self.editor.locked_layers
+            if hidden:
+                p.fillRect(QRectF(self.LEFT, y+1, self.width()-self.LEFT, self.ROW-1), QColor(0, 0, 0, 70))
+            p.setPen(QColor('#5d6b80' if hidden else '#94a6be'))
+            p.drawText(10, y+22, f'Layer {row+1}')
+            for rect, on, text in ((self.eye_rect(row), not hidden, '表示'), (self.lock_rect(row), locked, 'ロック')):
+                p.setPen(QPen(QColor('#5f87bd' if on else '#3a475b'), 1))
+                p.setBrush(QColor('#2c4a72' if on else '#1a212d'))
+                p.drawRoundedRect(rect, 3, 3)
+                p.setPen(QColor('#e5eefc' if on else '#6c7a90'))
+                p.drawText(rect, Qt.AlignCenter, text)
         self.boxes = []
         for c in sorted(self.editor.clips, key=lambda c: (c.layer, self.editor.clips.index(c))):
             row = c.layer
             rect = QRectF(self.LEFT+c.offset*self.scale, self.TOP+row*self.ROW+5, max(5, c.duration*self.scale), self.ROW-10)
-            p.setBrush(QColor({'audio':'#246c65','text':'#6f4f8b','image':'#795e36','video':'#294d7c','filter':'#8b4f5b'}[c.kind]))
+            fill=QColor({'audio':'#246c65','text':'#6f4f8b','image':'#795e36','video':'#294d7c','filter':'#8b4f5b','shape':'#4f7d3a'}[c.kind])
+            if c.layer in self.editor.hidden_layers:fill=fill.darker(220)
+            p.setBrush(fill)
             selected=c.uid in self.selected_uids
             p.setPen(QPen(QColor('#a0caff' if selected else '#47658b'), 2 if selected else 1))
             p.drawRoundedRect(rect, 4, 4)
@@ -349,7 +421,7 @@ class Timeline(QWidget):
                         baseline=rect.bottom()-11
                         half_height=max(2,min(9,(rect.height()-8)/2))
                         for x in range(max(0,int(visible.left())),min(self.width(),int(visible.right())+1)):
-                            local_time=c.start+(x-(self.LEFT+c.offset*self.scale))/self.scale
+                            local_time=c.start+(x-(self.LEFT+c.offset*self.scale))/self.scale*c.speed
                             peak_index=int(max(0,local_time)*100)
                             if peak_index<len(peaks):
                                 amplitude=peaks[peak_index]*half_height
@@ -360,7 +432,12 @@ class Timeline(QWidget):
             p.setPen(QColor('#eef4ff'))
             p.drawText(int(rect.x()+8), int(rect.y()+20), c.name)
             p.setPen(QColor('#b4c8df'))
-            p.drawText(int(rect.x()+8), int(rect.y()+37), f'{c.duration:.2f}s')
+            details=[f'{c.duration:.2f}s']
+            if c.speed!=1:details.append(f'×{c.speed:.2f}')
+            if c.blend!='normal':details.append('合成')
+            if c.effects:details.append(f'効果{len(c.effects)}')
+            if c.fade_in or c.fade_out:details.append('フェード')
+            p.drawText(int(rect.x()+8), int(rect.y()+37), '  '.join(details))
             p.restore()
             self.boxes.append((rect, c.uid))
         p.setPen(QPen(QColor('#89bbf5'),1,Qt.DashLine))
@@ -413,8 +490,16 @@ class Timeline(QWidget):
         layer=min(15,self.layer_at(position.y()))
         hit=self.hit_clip(position)
         menu=QMenu(self)
+        effect_actions={};blend_actions={}
         if hit:
             clip=hit[1]
+            if clip.kind in ('video','image','text','shape') or (clip.kind=='filter' and clip.filter_type=='effect'):
+                effect_menu=menu.addMenu('フィルタ効果を追加')
+                effect_actions={effect_menu.addAction(spec['name']):kind for kind,spec in EFFECTS.items()}
+            if clip.kind in ('video','image','text','shape'):
+                blend_menu=menu.addMenu('合成モード')
+                for key,name in BLEND_MODES.items():
+                    action=blend_menu.addAction(name);action.setCheckable(True);action.setChecked(clip.blend==key);blend_actions[action]=key
             if clip.kind=='filter':
                 remove=menu.addAction('フィルタを削除')
             else:
@@ -427,9 +512,14 @@ class Timeline(QWidget):
         else:
             text_action=menu.addAction('テキストを追加')
             media_action=menu.addAction('素材を追加…')
+            shape_menu=menu.addMenu('図形を追加')
+            shape_actions={shape_menu.addAction(name):key for key,name in SHAPES.items()}
             filter_menu=menu.addMenu('フィルタを追加')
             filter_actions={name:filter_menu.addAction(name) for name in ('シーンチェンジ','フェード','モザイク','ぼかし')}
             filter_types={'シーンチェンジ':'scenechange','フェード':'fade','モザイク':'mosaic','ぼかし':'blur'}
+            filter_menu.addSeparator()
+            object_menu=filter_menu.addMenu('フィルタ効果オブジェクト（下のレイヤー全体に適用）')
+            effect_actions={object_menu.addAction(spec['name']):kind for kind,spec in EFFECTS.items()}
             menu.addSeparator()
         selected=set(self.selected_uids)
         if not selected and self.editor.selected:selected={self.editor.selected}
@@ -442,12 +532,17 @@ class Timeline(QWidget):
         chosen=menu.exec_(global_position)
         if hit:
             clip=hit[1]
-            if clip.kind=='filter' and chosen==remove:self.editor.delete_clip(clip.uid)
+            if chosen in effect_actions:self.editor.add_effect(effect_actions[chosen],clip.uid)
+            elif chosen in blend_actions:
+                self.editor.select(clip.uid);self.editor.apply_choice('blend',blend_actions[chosen])
+            elif clip.kind=='filter' and chosen==remove:self.editor.delete_clip(clip.uid)
             elif clip.kind!='filter' and chosen==add:self.editor.add_keyframe(clip.uid,position_time)
             elif clip.kind!='filter' and chosen==remove and nearest:self.editor.remove_keyframe(clip.uid,nearest['time'])
         else:
             if chosen==text_action:self.editor.add_text(offset=position_time,layer=layer)
             elif chosen==media_action:self.editor.import_files(offset=position_time,layer=layer)
+            elif chosen in shape_actions:self.editor.add_shape(shape_actions[chosen],position_time,layer)
+            elif chosen in effect_actions:self.editor.add_filter('effect',position_time,layer,effect_actions[chosen])
             else:
                 selected_type=next((kind for name,kind in filter_types.items() if chosen==filter_actions[name]),None)
                 if selected_type:self.editor.add_filter(selected_type,position_time,layer)
@@ -472,6 +567,12 @@ class Timeline(QWidget):
             event.accept()
             return
         if event.button()!=Qt.LeftButton:return
+        if event.pos().x()<self.LEFT and event.pos().y()>=self.TOP:
+            row=self.layer_at(event.pos().y())
+            if self.eye_rect(row).contains(event.pos()):
+                self.editor.toggle_layer('hidden_layers',row);event.accept();return
+            if self.lock_rect(row).contains(event.pos()):
+                self.editor.toggle_layer('locked_layers',row);event.accept();return
         self.editor.stop_playback()
         self.drag=None
         self.scrubbing=False
@@ -507,6 +608,10 @@ class Timeline(QWidget):
                 edge_zone=min(8.0,rect.width()/3)
                 mode='left' if event.pos().x()-rect.left()<edge_zone else 'right' if rect.right()-event.pos().x()<edge_zone else 'move'
             group=[{'uid':clip.uid,'offset':clip.offset,'layer':clip.layer} for clip in self.editor.clips if clip.uid in self.selected_uids] if mode=='move' else None
+            if c.layer in self.editor.locked_layers or (group and any(item['layer'] in self.editor.locked_layers for item in group)):
+                self.editor.statusBar().showMessage('ロック中のレイヤーです。レイヤー名の下の「ロック」で解除できます',3000)
+                event.accept()
+                return
             self.drag={'uid':c.uid,'x':event.pos().x(),'y':event.pos().y(),'offset':c.offset,'layer':c.layer,'start':c.start,'duration':c.duration,'keyframes':copy.deepcopy(c.keyframes),'point_index':point_index,'mode':mode,'saved':False,'group':group,'modifiers':modifiers}
             event.accept()
             return
@@ -569,6 +674,14 @@ class Timeline(QWidget):
                 self.editor.select_segment(c.uid,c.offset+local)
         elif d['mode']=='move':
             group=d['group'] or [{'uid':c.uid,'offset':d['offset'],'layer':d['layer']}]
+            exclude={item['uid'] for item in group}
+            points=self.snap_points(exclude)
+            first=min(item['offset'] for item in group)
+            last=max(item['offset']+(self.editor.by_id(item['uid']).duration if self.editor.by_id(item['uid']) else 0) for item in group)
+            snapped_start=self.snap(first+delta,exclude,points)
+            snapped_end=self.snap(last+delta,exclude,points)
+            if snapped_start!=first+delta:delta=snapped_start-first
+            elif snapped_end!=last+delta:delta=snapped_end-last
             delta=max(-min(item['offset'] for item in group),delta)
             layer_delta=round((position.y()-d['y'])/self.ROW)
             layer_delta=max(-min(item['layer'] for item in group),min(15-max(item['layer'] for item in group),layer_delta))
@@ -576,12 +689,14 @@ class Timeline(QWidget):
                 clip=self.editor.by_id(item['uid'])
                 if clip:clip.offset=item['offset']+delta;clip.layer=item['layer']+layer_delta
         elif d['mode']=='left':
-            lower=max(-d['offset'],-d['start']) if c.kind in ('video','audio') else -d['offset']
+            delta=self.snap(d['offset']+delta,{c.uid})-d['offset']
+            lower=max(-d['offset'],-d['start']/c.speed) if c.kind in ('video','audio') else -d['offset']
             delta=min(d['duration']-.04,max(lower,delta));c.offset=d['offset']+delta;c.duration=d['duration']-delta
             c.keyframes=[{'time':float(point['time'])-delta,'values':copy.deepcopy(point.get('values',{}))} for point in d['keyframes'] if float(point['time'])>delta and float(point['time'])-delta<c.duration-.04]
-            if c.kind in ('video','audio'):c.start=d['start']+delta
+            if c.kind in ('video','audio'):c.start=max(0.0,d['start']+delta*c.speed)
         else:
-            c.duration=max(.04,min(c.source_duration-c.start,d['duration']+delta))
+            delta=self.snap(d['offset']+d['duration']+delta,{c.uid})-d['offset']-d['duration']
+            c.duration=max(.04,min((c.source_duration-c.start)/c.speed,d['duration']+delta))
             c.keyframes=[point for point in d['keyframes'] if float(point['time'])<c.duration-.04]
         self.editor.dirty=True;self.refresh();self.editor.update_properties();self.editor.update_title()
         if d['mode']=='keyframe' and d['point_index'] is not None:

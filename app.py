@@ -12,7 +12,7 @@ import uuid
 from PyQt5.QtCore import Qt, QTimer, QProcess, QSettings, QUrl, QEvent
 from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap, QKeySequence, QDesktopServices, QIcon
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QDockWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QAbstractItemView, QFormLayout, QDoubleSpinBox, QComboBox, QFileDialog, QMessageBox, QAction, QScrollArea, QSlider, QProgressBar, QShortcut, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QInputDialog, QColorDialog, QDialog, QDialogButtonBox, QSpinBox, QCheckBox)
-from core import Clip, probe, total_duration, save_project, load_project, render_command, active_visuals, animated_value, video_stream_command, audio_stream_command, font_families
+from core import Clip, probe, total_duration, save_project, load_project, render_command, active_visuals, animated_value, video_stream_command, audio_stream_command, font_families, EFFECTS, BLEND_MODES, SHAPES, CODECS, new_effect, effects_graph, placed_size, frame_command
 from widgets import Timeline, CompositionView
 
 STYLE = '''
@@ -39,7 +39,7 @@ QProgressBar { border:1px solid #354054; border-radius:3px; text-align:center; }
 QProgressBar::chunk { background:#347bda; }
 '''
 
-APP_VERSION = '1.01'
+APP_VERSION = '1.10'
 
 
 def stamp(sec):
@@ -61,6 +61,9 @@ class Editor(QMainWindow):
         self.timeline_clipboard = []
         self.selected_segment = 0
         self.output_resolution, self.output_fps = '1920x1080', 60
+        self.hidden_layers, self.locked_layers = set(), set()
+        self.effect_index = 0
+        self.effect_ui_key = None
         self.history, self.future = [], []
         self.project = None
         self.dirty = False
@@ -219,12 +222,24 @@ class Editor(QMainWindow):
         form=QFormLayout()
         self.clip_fields={}
         self.clip_field_rows={}
-        for key,label,low,high,decimals,step in [('start','素材の開始（秒）',0,86400,2,.1),('duration','長さ（秒）',.04,86400,2,.1),('offset','配置時刻（秒）',0,86400,2,.1),('font_size','文字サイズ',8,300,0,2),('fade_in','フェードイン（秒）',0,86400,2,.1),('fade_out','フェードアウト（秒）',0,86400,2,.1)]:
+        for key,label,low,high,decimals,step in [('start','素材の開始（秒）',0,86400,2,.1),('duration','長さ（秒）',.04,86400,2,.1),('offset','配置時刻（秒）',0,86400,2,.1),('speed','再生速度（%）',10,1000,1,10),('pan','左右（-100〜100）',-100,100,0,5),('font_size','文字サイズ',8,300,0,2),('line_spacing','行間',-50,300,0,1),('width','図形の幅',1,4096,0,10),('height','図形の高さ',1,4096,0,10),('line_width','ライン幅（0で塗り）',0,500,0,1),('fade_in','フェードイン（秒）',0,86400,2,.1),('fade_out','フェードアウト（秒）',0,86400,2,.1)]:
             field=QDoubleSpinBox();field.setRange(low,high);field.setDecimals(decimals);field.setSingleStep(step);field.setKeyboardTracking(False)
             field.valueChanged.connect(self.apply_properties)
             self.clip_fields[key]=field
             label_widget=QLabel(label);form.addRow(label_widget,field)
             self.clip_field_rows[key]=(label_widget,field)
+        self.blend_combo=QComboBox()
+        for key,name in BLEND_MODES.items():self.blend_combo.addItem(name,key)
+        self.blend_combo.currentIndexChanged.connect(lambda *_:self.apply_choice('blend',self.blend_combo.currentData()))
+        self.blend_label=QLabel('合成モード');form.addRow(self.blend_label,self.blend_combo)
+        self.shape_combo=QComboBox()
+        for key,name in SHAPES.items():self.shape_combo.addItem(name,key)
+        self.shape_combo.currentIndexChanged.connect(lambda *_:self.apply_choice('shape_type',self.shape_combo.currentData()))
+        self.shape_label=QLabel('図形の種類');form.addRow(self.shape_label,self.shape_combo)
+        self.align_combo=QComboBox()
+        for key,name in (('left','左寄せ'),('center','中央揃え'),('right','右寄せ')):self.align_combo.addItem(name,key)
+        self.align_combo.currentIndexChanged.connect(lambda *_:self.apply_choice('text_align',self.align_combo.currentData()))
+        self.align_label=QLabel('文字揃え');form.addRow(self.align_label,self.align_combo)
         layout.addLayout(form)
         self.text_editor=QTextEdit();self.text_editor.setPlaceholderText('テキストの内容');self.text_editor.setFixedHeight(85)
         self.text_timer=QTimer(self);self.text_timer.setSingleShot(True);self.text_timer.timeout.connect(self.apply_text);self.text_editor.textChanged.connect(self.text_edited)
@@ -249,10 +264,147 @@ class Editor(QMainWindow):
         self.filter_strength_spin=QSpinBox();self.filter_strength_spin.setRange(1,100);self.filter_strength_spin.valueChanged.connect(self.apply_filter_strength)
         filter_row.addWidget(self.filter_strength_label);filter_row.addWidget(self.filter_strength_spin);filter_row.addStretch()
         layout.addWidget(self.filter_box)
+        self.build_effect_panel(layout)
         hint=QLabel('左右の値はタイムラインで選択した区間の移動前・後です。中間点は素材の右クリックから追加します。\nレイヤー番号が大きい素材を手前に表示します。')
         hint.setObjectName('muted');hint.setWordWrap(True);layout.addWidget(hint);layout.addStretch()
         scroll=QScrollArea();scroll.setWidget(box);scroll.setWidgetResizable(True)
         self.props_dock=self.dock('properties','プロパティ',scroll,Qt.RightDockWidgetArea)
+
+    def build_effect_panel(self, layout):
+        from PyQt5.QtWidgets import QToolButton, QGroupBox
+        self.effect_box=QGroupBox('フィルタ効果');box=QVBoxLayout(self.effect_box)
+        self.effect_list=QListWidget();self.effect_list.setMaximumHeight(120)
+        self.effect_list.currentRowChanged.connect(self.effect_row_changed)
+        self.effect_list.itemChanged.connect(self.effect_item_changed)
+        box.addWidget(self.effect_list)
+        row=QHBoxLayout()
+        add=QToolButton();add.setText('＋ 効果を追加');add.setPopupMode(QToolButton.InstantPopup)
+        from PyQt5.QtWidgets import QMenu
+        menu=QMenu(add)
+        for kind,spec in EFFECTS.items():
+            menu.addAction(spec['name'],lambda k=kind:self.add_effect(k))
+        add.setMenu(menu);row.addWidget(add)
+        row.addWidget(button('↑',lambda:self.move_effect(-1)));row.addWidget(button('↓',lambda:self.move_effect(1)));row.addWidget(button('削除',self.remove_effect))
+        box.addLayout(row)
+        self.effect_params=QWidget();self.effect_form=QFormLayout(self.effect_params);self.effect_form.setContentsMargins(0,0,0,0)
+        box.addWidget(self.effect_params)
+        self.effect_widgets={}
+        layout.addWidget(self.effect_box)
+
+    def update_effect_panel(self, c):
+        usable=c is not None and (c.kind in ('video','image','text','shape') or (c.kind=='filter' and c.filter_type=='effect'))
+        self.effect_box.setVisible(usable)
+        if not usable:
+            self.effect_ui_key=None
+            return
+        self.effect_index=max(0,min(self.effect_index,len(c.effects)-1))
+        key=(c.uid,tuple(e['type'] for e in c.effects),self.effect_index)
+        if key!=self.effect_ui_key:
+            self.effect_ui_key=key
+            self.effect_list.blockSignals(True);self.effect_list.clear()
+            for effect in c.effects:
+                item=QListWidgetItem(EFFECTS[effect['type']]['name'])
+                item.setFlags(item.flags()|Qt.ItemIsUserCheckable)
+                self.effect_list.addItem(item)
+            self.effect_list.setCurrentRow(self.effect_index if c.effects else -1)
+            self.effect_list.blockSignals(False)
+            while self.effect_form.rowCount():self.effect_form.removeRow(0)
+            self.effect_widgets={}
+            if c.effects:
+                effect=c.effects[self.effect_index]
+                for spec in EFFECTS[effect['type']]['params']:
+                    if spec['type']=='color':
+                        widget=button('色を選択…',lambda checked=False,k=spec['key']:self.choose_effect_color(k))
+                    elif spec['type']=='bool':
+                        widget=QCheckBox();widget.toggled.connect(lambda value,k=spec['key']:self.change_effect_param(k,1 if value else 0))
+                    else:
+                        widget=QDoubleSpinBox();widget.setRange(spec['min'],spec['max']);widget.setDecimals(0 if float(spec['max'])>=10 else 2);widget.setKeyboardTracking(False)
+                        widget.valueChanged.connect(lambda value,k=spec['key']:self.change_effect_param(k,value))
+                    self.effect_widgets[spec['key']]=(spec,widget)
+                    self.effect_form.addRow(spec['label'],widget)
+                if not EFFECTS[effect['type']]['params']:
+                    self.effect_form.addRow(QLabel('設定項目はありません'))
+        self.effect_list.blockSignals(True)
+        for i,effect in enumerate(c.effects):
+            self.effect_list.item(i).setCheckState(Qt.Checked if effect.get('enabled',True) else Qt.Unchecked)
+        self.effect_list.blockSignals(False)
+        if c.effects:
+            params=c.effects[self.effect_index].get('params',{})
+            for k,(spec,widget) in self.effect_widgets.items():
+                value=params.get(k,spec['default'])
+                widget.blockSignals(True)
+                if spec['type']=='color':widget.setText(f'色 {value}');widget.setStyleSheet(f'border-left:14px solid {value};')
+                elif spec['type']=='bool':widget.setChecked(bool(value))
+                else:widget.setValue(float(value))
+                widget.blockSignals(False)
+
+    def effect_row_changed(self,row):
+        if row>=0 and row!=self.effect_index:
+            self.effect_index=row;self.update_properties()
+
+    def effect_item_changed(self,item):
+        c=self.current()
+        row=self.effect_list.row(item)
+        if self.loading or not c or not 0<=row<len(c.effects):return
+        enabled=item.checkState()==Qt.Checked
+        if c.effects[row].get('enabled',True)==enabled:return
+        self.checkpoint();c.effects[row]['enabled']=enabled;self.effects_changed(c)
+
+    def effects_changed(self,c):
+        self.canvas.static_cache.pop(c.uid,None)
+        self.frame_cache.pop(c.uid,None)
+        self.changed()
+
+    def add_effect(self,kind,uid=None):
+        c=self.by_id(uid) if uid else self.current()
+        if not c or not (c.kind in ('video','image','text','shape') or (c.kind=='filter' and c.filter_type=='effect')):
+            self.statusBar().showMessage('映像・画像・テキスト・図形・フィルタ効果オブジェクトを選択してください',4000);return
+        if len(c.effects)>=32:return
+        self.checkpoint();c.effects.append(new_effect(kind))
+        self.select(c.uid);self.effect_index=len(c.effects)-1;self.effects_changed(c)
+
+    def remove_effect(self):
+        c=self.current()
+        if not c or not c.effects:return
+        self.checkpoint();c.effects.pop(self.effect_index);self.effect_index=max(0,self.effect_index-1);self.effects_changed(c)
+
+    def move_effect(self,delta):
+        c=self.current()
+        if not c or not c.effects:return
+        target=self.effect_index+delta
+        if not 0<=target<len(c.effects):return
+        self.checkpoint();c.effects[self.effect_index],c.effects[target]=c.effects[target],c.effects[self.effect_index]
+        self.effect_index=target;self.effects_changed(c)
+
+    def change_effect_param(self,key,value):
+        c=self.current()
+        if self.loading or not c or not c.effects:return
+        params=c.effects[self.effect_index].setdefault('params',{})
+        if params.get(key)==value:return
+        self.checkpoint();params[key]=value;self.effects_changed(c)
+
+    def choose_effect_color(self,key):
+        c=self.current()
+        if not c or not c.effects:return
+        current=c.effects[self.effect_index].get('params',{}).get(key,'#ffffff')
+        color=QColorDialog.getColor(QColor(current),self,'色')
+        if color.isValid():self.change_effect_param(key,color.name())
+
+    def apply_choice(self,key,value):
+        c=self.current()
+        if self.loading or not c or value is None or getattr(c,key)==value:return
+        self.checkpoint();setattr(c,key,value)
+        self.canvas.static_cache.pop(c.uid,None)
+        self.changed()
+
+    def toggle_layer(self,key,layer):
+        layers=getattr(self,key)
+        if layer in layers:layers.discard(layer)
+        else:layers.add(layer)
+        self.dirty=True
+        self.stop_playback()
+        self.refresh()
+        self.request_edit_frame()
 
     def build_timeline(self):
         box = QWidget()
@@ -263,6 +415,11 @@ class Editor(QMainWindow):
         row.addWidget(button('やり直す', self.redo))
         row.addWidget(button('＋ 素材を追加', self.import_files, True))
         row.addWidget(button('＋ テキスト', self.add_text))
+        from PyQt5.QtWidgets import QToolButton, QMenu
+        shape_button=QToolButton();shape_button.setText('＋ 図形');shape_button.setPopupMode(QToolButton.InstantPopup)
+        shape_menu=QMenu(shape_button)
+        for key,name in SHAPES.items():shape_menu.addAction(name,lambda k=key:self.add_shape(k))
+        shape_button.setMenu(shape_menu);row.addWidget(shape_button)
         row.addWidget(button('削除', self.delete))
         row.addSpacing(12)
         row.addWidget(button('◀ 1フレーム', lambda: self.seek(self.position-1/self.output_fps)))
@@ -270,6 +427,8 @@ class Editor(QMainWindow):
         row.addWidget(button('■ 停止', self.stop_playback))
         row.addWidget(button('1フレーム ▶', lambda: self.seek(self.position+1/self.output_fps)))
         row.addStretch()
+        self.snap_check=QCheckBox('スナップ');self.snap_check.setChecked(True);self.snap_check.toggled.connect(self.set_snap)
+        row.addWidget(self.snap_check)
         row.addWidget(QLabel('ズーム'))
         zoom = QSlider(Qt.Horizontal)
         zoom.setRange(10, 200)
@@ -284,7 +443,7 @@ class Editor(QMainWindow):
         scroll.setWidget(self.timeline)
         scroll.setWidgetResizable(True)
         layout.addWidget(scroll)
-        hint = QLabel('空白をクリック・ドラッグ：カーソル移動  /  素材本体をドラッグ：移動  /  端をドラッグ：長さ変更  /  ファイルをドロップ：追加')
+        hint = QLabel('空白をクリック・ドラッグ：カーソル移動  /  素材本体をドラッグ：移動  /  端をドラッグ：長さ変更  /  ファイルをドロップ：追加  /  ←→：1フレーム  Shift+←→：1秒  Home/End：先頭・末尾  /  Alt+ドラッグ：スナップ無効')
         hint.setWordWrap(True)
         hint.setObjectName('muted')
         layout.addWidget(hint)
@@ -297,6 +456,7 @@ class Editor(QMainWindow):
             action.setShortcut(shortcut)
             action.triggered.connect(lambda checked=False, f=callback: f())
             file_menu.addAction(action)
+        frame_action=QAction('現在のフレームを画像で保存…',self);frame_action.setShortcut('Ctrl+Shift+E');frame_action.triggered.connect(self.save_frame_dialog);file_menu.addAction(frame_action)
         file_menu.addSeparator()
         file_menu.addAction('環境設定…', self.environment_preferences)
         video_menu=self.menuBar().addMenu('動画')
@@ -307,6 +467,15 @@ class Editor(QMainWindow):
             action.setShortcut(shortcut)
             action.triggered.connect(callback)
             edit.addAction(action)
+        display=self.menuBar().addMenu('表示')
+        self.grid_action=QAction('グリッドを表示',self);self.grid_action.setCheckable(True);self.grid_action.setShortcut('Ctrl+G')
+        self.grid_action.toggled.connect(self.set_grid);display.addAction(self.grid_action)
+        snap_action=QAction('タイムラインのスナップ',self);snap_action.setCheckable(True);snap_action.setChecked(True)
+        snap_action.toggled.connect(lambda value:self.snap_check.setChecked(value));self.snap_check.toggled.connect(snap_action.setChecked)
+        display.addAction(snap_action)
+        display.addSeparator()
+        display.addAction('すべてのレイヤーを表示',self.show_all_layers)
+        display.addAction('すべてのレイヤーのロックを解除',self.unlock_all_layers)
         view = self.menuBar().addMenu('ウインドウ')
         view.addAction('4ウインドウに分割', self.four_windows)
         view.addAction('1ウインドウにまとめる', self.join_windows)
@@ -370,6 +539,45 @@ class Editor(QMainWindow):
             self.config.setValue('restore_layout',restore.isChecked())
 
 
+    def set_grid(self,value):
+        self.canvas.show_grid=bool(value);self.canvas.viewport().update()
+
+    def set_snap(self,value):
+        self.timeline.snap_enabled=bool(value)
+
+    def show_all_layers(self):
+        if self.hidden_layers:
+            self.hidden_layers.clear();self.dirty=True;self.refresh()
+
+    def unlock_all_layers(self):
+        if self.locked_layers:
+            self.locked_layers.clear();self.dirty=True;self.refresh()
+
+    def add_shape(self,shape_type='rect',offset=None,layer=None):
+        self.stop_playback();self.checkpoint()
+        c=Clip('', 'shape', 86400, duration=5, width=240, height=240, color='#4da3ff', shape_type=shape_type if shape_type in SHAPES else 'rect',
+               offset=self.position if offset is None else offset, layer=1 if layer is None else max(0,min(15,layer)))
+        self.clips.append(c);self.selected,self.position=c.uid,c.offset
+        self.changed()
+
+    def save_frame_dialog(self):
+        if not self.clips:
+            self.statusBar().showMessage('素材を追加してください',4000);return
+        path,_=QFileDialog.getSaveFileName(self,'現在のフレームを画像で保存',f'frame-{self.position:.2f}s.png','PNG (*.png)')
+        if not path:return
+        if not path.lower().endswith('.png'):path+='.png'
+        self.stop_playback()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            args=frame_command(copy.deepcopy(self.clips),self.position,path,self.output_resolution,self.output_fps,self.temp.name,self.hidden_layers)
+            result=subprocess.run(args,capture_output=True,text=True,timeout=120)
+            if result.returncode!=0:raise RuntimeError(result.stderr[-1500:])
+            self.statusBar().showMessage(f'画像を保存しました: {path}',5000)
+        except Exception as e:
+            QMessageBox.warning(self,'画像の保存エラー',str(e))
+        finally:
+            QApplication.restoreOverrideCursor()
+
     def docks(self):
         return [self.preview_dock, self.props_dock, self.timeline_dock]
 
@@ -432,7 +640,7 @@ class Editor(QMainWindow):
         return next((c for c in self.clips if c.uid == self.selected), None)
 
     def settings(self):
-        return {'resolution': self.output_resolution, 'fps': self.output_fps}
+        return {'resolution': self.output_resolution, 'fps': self.output_fps, 'hidden_layers': sorted(self.hidden_layers), 'locked_layers': sorted(self.locked_layers)}
 
     def checkpoint(self):
         self.history.append(copy.deepcopy((self.clips, self.settings())))
@@ -462,7 +670,7 @@ class Editor(QMainWindow):
                 self.timeline.selected_uids={self.selected}
         self.list.clear()
         for c in self.clips:
-            tag = {'video':'映像', 'audio':'音声', 'image':'画像', 'text':'文字','filter':'フィルタ'}[c.kind]
+            tag = {'video':'映像', 'audio':'音声', 'image':'画像', 'text':'文字','filter':'フィルタ','shape':'図形'}[c.kind]
             layer_label=f'  L{c.layer+1}'
             item = QListWidgetItem(f'{tag}{layer_label}  {c.name}  ·  {stamp(c.offset)} — {stamp(c.offset+c.duration)}')
             item.setData(Qt.UserRole, c.uid)
@@ -518,6 +726,7 @@ class Editor(QMainWindow):
             'audio':('volume',),
             'image':('x','y','scale','opacity','rotation'),
             'text':('x','y','scale','opacity','rotation'),
+            'shape':('x','y','scale','opacity','rotation'),
         }.get(c.kind if c else '',())
         if self.motion_key not in visible_keys:
             self.motion_key=None
@@ -537,22 +746,23 @@ class Editor(QMainWindow):
             self.motion_buttons[key].setEnabled(allowed)
             self.motion_buttons[key].setChecked(self.motion_key==key)
         for key,field in self.clip_fields.items():
-            enabled=c is not None
-            visible= c is not None and ((key=='start' and c.kind in ('video','audio')) or (key in ('duration','offset')) or (key=='font_size' and c.kind=='text') or (key in ('fade_in','fade_out') and c.has_audio))
+            visible=self.field_applies(key,c)
             label_widget,field_widget=self.clip_field_rows[key]
             label_widget.setVisible(visible);field_widget.setVisible(visible)
-            if c:
-                if key=='start':enabled=c.kind in ('video','audio')
-                if key=='font_size':enabled=c.kind=='text'
-                if key in ('fade_in','fade_out'):
-                    field.setMaximum(max(0,c.duration))
-                    enabled=c.has_audio
-            field.setEnabled(enabled)
-            if key=='font_size':value=c.font_size if c else 64
-            else:value=getattr(c,key) if c else 0
+            if c and key in ('fade_in','fade_out'):field.setMaximum(max(0,c.duration))
+            field.setEnabled(visible)
+            if not c:value=field.minimum() if field.minimum()>0 else 0
+            elif key=='speed':value=c.speed*100
+            elif key=='pan':value=c.pan*100
+            else:value=getattr(c,key)
             field.setValue(value)
+        visual=c is not None and c.kind in ('video','image','text','shape')
+        for label_widget,widget,show,key in ((self.blend_label,self.blend_combo,visual,'blend'),(self.shape_label,self.shape_combo,c is not None and c.kind=='shape','shape_type'),(self.align_label,self.align_combo,c is not None and c.kind=='text','text_align')):
+            label_widget.setVisible(show);widget.setVisible(show)
+            if show:widget.setCurrentIndex(max(0,widget.findData(getattr(c,key))))
         is_text=c is not None and c.kind=='text'
-        self.text_editor.setVisible(is_text);self.color_button.setVisible(is_text)
+        self.text_editor.setVisible(is_text);self.color_button.setVisible(is_text or (c is not None and c.kind=='shape'))
+        if c is not None and c.kind in ('text','shape'):self.color_button.setText(f'{"文字色" if is_text else "図形の色"}を変更…  {c.color}')
         self.text_style_box.setVisible(is_text)
         for widget in (self.font_family_combo,self.outline_width,self.shadow_size,self.shadow_blur,self.outline_color_button,self.shadow_color_button):widget.setEnabled(is_text)
         if is_text:
@@ -562,8 +772,9 @@ class Editor(QMainWindow):
             self.outline_color_button.setText(f'縁取り色 {c.outline_color}')
             self.shadow_color_button.setText(f'影の色 {c.shadow_color}')
         if is_text and self.text_editor.toPlainText()!=c.text:self.text_editor.setPlainText(c.text)
-        is_filter=c is not None and c.kind=='filter'
+        is_filter=c is not None and c.kind=='filter' and c.filter_type!='effect'
         self.filter_box.setVisible(is_filter)
+        self.update_effect_panel(c)
         if is_filter:
             self.filter_strength_label.setText({'blur':'ぼかし半径','mosaic':'粒子サイズ','fade':'フェード時間（0.01秒単位）','scenechange':'切替時間（0.01秒単位）'}.get(c.filter_type,'効果の強さ'))
             self.filter_strength_spin.setValue(c.filter_strength)
@@ -580,6 +791,16 @@ class Editor(QMainWindow):
         self.curve_label.setEnabled(mode=='curve');self.curve_strength.setEnabled(mode=='curve')
         self.curve_strength.setValue(float(anim.get('strength',3)))
         self.loading=False
+
+    def field_applies(self,key,c):
+        if c is None:return False
+        if key in ('duration','offset'):return True
+        if key in ('start','speed'):return c.kind in ('video','audio')
+        if key=='pan':return c.has_audio
+        if key in ('font_size','line_spacing'):return c.kind=='text'
+        if key in ('width','height','line_width'):return c.kind=='shape'
+        if key in ('fade_in','fade_out'):return c.kind!='filter'
+        return False
 
     def toggle_motion(self,key):
         self.motion_key=None if self.motion_key==key and self.motion_panel.isVisible() else key
@@ -669,10 +890,12 @@ class Editor(QMainWindow):
         self.select(uid);self.selected_segment=sum(1 for point in c.keyframes if float(point['time'])<=local);self.dirty=True;self.seek(c.offset+local);self.refresh()
         self.statusBar().showMessage(f'中間点を {local:.2f} 秒に追加しました',3000)
 
-    def add_filter(self,filter_type,offset,layer=0):
-        if filter_type not in ('scenechange','fade','mosaic','blur'):return
+    def add_filter(self,filter_type,offset,layer=0,effect=None):
+        if filter_type not in ('scenechange','fade','mosaic','blur','effect'):return
+        if filter_type=='effect' and effect not in EFFECTS:return
         self.checkpoint()
-        clip=Clip('', 'filter', 86400, duration=2.0, offset=max(0.0,offset), layer=max(0,min(15,layer)), filter_type=filter_type)
+        clip=Clip('', 'filter', 86400, duration=2.0 if filter_type!='effect' else 5.0, offset=max(0.0,offset), layer=max(0,min(15,layer)), filter_type=filter_type, effects=[new_effect(effect)] if effect else [])
+        self.effect_index=0
         self.clips.append(clip);self.selected=clip.uid;self.selected_segment=0
         self.changed()
         self.statusBar().showMessage(f'{clip.name} フィルタを追加しました',3000)
@@ -768,11 +991,17 @@ class Editor(QMainWindow):
         self.stop_playback();c=self.current();self.checkpoint()
         old_duration=c.duration
         for key,field in self.clip_fields.items():
+            if not self.field_applies(key,c):continue
             val=field.value()
-            if key!='font_size' or c.kind=='text':
-                if key in ('fade_in','fade_out'):
-                    val=min(val,c.duration)
-                setattr(c,key,int(val) if key=='font_size' else val)
+            if key in ('fade_in','fade_out'):val=min(val,c.duration)
+            if key=='speed':val=max(.1,min(10.0,val/100))
+            if key=='pan':val=max(-1.0,min(1.0,val/100))
+            if key in ('font_size','line_spacing','width','height','line_width'):val=int(round(val))
+            setattr(c,key,val)
+        if c.kind in ('video','audio'):
+            c.start=min(c.start,max(0.0,c.source_duration-.04*c.speed))
+            c.duration=max(.04,min(c.duration,(c.source_duration-c.start)/c.speed))
+            c.fade_in=min(c.fade_in,c.duration);c.fade_out=min(c.fade_out,c.duration)
         if c.duration<old_duration:
             c.keyframes=[point for point in c.keyframes if float(point['time'])<c.duration-.04]
         self.changed()
@@ -799,22 +1028,26 @@ class Editor(QMainWindow):
         if self.playback:
             return
         self.canvas.sync()
-        for c in active_visuals(self.clips, self.position):
+        for c in active_visuals(self.clips, self.position, self.hidden_layers):
             if c.kind != 'video':
                 continue
-            source_time = c.start+self.position-c.offset
+            source_time = c.start+(self.position-c.offset)*c.speed
+            fx_key = repr([e for e in c.effects if e.get('enabled',True)])
             cached = self.frame_cache.get(c.uid)
-            if cached and abs(cached[0]-source_time) < .015:
+            if cached and abs(cached[0]-source_time) < .015 and (cached[3] if len(cached)>3 else '[]') == fx_key:
                 continue
             if c.uid in self.frame_processes:
                 continue
+            fit = min(960/c.width, 540/c.height)
+            frame_w = max(2, round(c.width*fit))
+            graph = '[0:v]scale=960:540:force_original_aspect_ratio=decrease,format=rgba[e0];'+';'.join(effects_graph(c.effects, 'e0', 'eout', 'p', frame_w/max(1.0, placed_size(c, self.temp.name)[0]/c.scale)))
             process = QProcess(self)
             self.frame_processes[c.uid] = (process, source_time)
-            process.finished.connect(lambda code, status, uid=c.uid, p=process, t=source_time: self.frame_done(uid, p, t, code))
+            process.finished.connect(lambda code, status, uid=c.uid, p=process, t=source_time, w=frame_w, k=fx_key: self.frame_done(uid, p, t, code, w, k))
             process.errorOccurred.connect(lambda error, uid=c.uid, p=process, t=source_time: self.frame_done(uid, p, t, -1) if error == QProcess.FailedToStart else None)
-            process.start('ffmpeg', ['-v', 'error', '-ss', str(source_time), '-i', c.path, '-frames:v', '1', '-vf', 'scale=960:540:force_original_aspect_ratio=decrease', '-threads', '1', '-f', 'image2pipe', '-vcodec', 'png', 'pipe:1'])
+            process.start('ffmpeg', ['-v', 'error', '-ss', str(source_time), '-i', c.path, '-frames:v', '1', '-filter_complex', graph, '-map', '[eout]', '-threads', '1', '-f', 'image2pipe', '-vcodec', 'png', 'pipe:1'])
 
-    def frame_done(self, uid, process, source_time, code):
+    def frame_done(self, uid, process, source_time, code, reference_width=None, fx_key='[]'):
         if uid not in self.frame_processes or self.frame_processes[uid][0] is not process:
             return
         self.frame_processes.pop(uid)
@@ -822,11 +1055,11 @@ class Editor(QMainWindow):
             pixmap = QPixmap()
             pixmap.loadFromData(bytes(process.readAllStandardOutput()))
             if not pixmap.isNull():
-                self.frame_cache[uid] = (source_time, pixmap)
-                self.canvas.set_frame(uid, pixmap)
+                self.frame_cache[uid] = (source_time, pixmap, reference_width, fx_key)
+                self.canvas.set_frame(uid, pixmap, reference_width)
         process.deleteLater()
         c = self.by_id(uid)
-        if code == 0 and c and c.offset <= self.position < c.offset+c.duration and abs(c.start+self.position-c.offset-source_time) >= .015:
+        if code == 0 and c and c.offset <= self.position < c.offset+c.duration and (abs(c.start+(self.position-c.offset)*c.speed-source_time) >= .015 or fx_key != repr([e for e in c.effects if e.get('enabled',True)])):
             self.request_edit_frame()
 
     def show_frame(self, pixmap):
@@ -899,7 +1132,9 @@ class Editor(QMainWindow):
         right = copy.deepcopy(c)
         import uuid
         right.uid = uuid.uuid4().hex
-        right.start += cut if c.kind in ('video', 'audio') else 0
+        right.start += cut*c.speed if c.kind in ('video', 'audio') else 0
+        right.fade_in = 0.0
+        c.fade_out = 0.0
         right.duration -= cut
         old_points=copy.deepcopy(c.keyframes)
         right.keyframes=[{'time':float(point['time'])-cut,'values':copy.deepcopy(point.get('values',{}))} for point in old_points if float(point['time'])>cut and float(point['time'])<c.duration-.04]
@@ -910,6 +1145,8 @@ class Editor(QMainWindow):
             setattr(right,key,value)
         right.offset += cut
         c.duration = cut
+        c.fade_in = min(c.fade_in, cut)
+        right.fade_out = min(right.fade_out, right.duration)
         c.keyframes=[point for point in c.keyframes if float(point['time'])<cut-.04]
         self.clips.insert(self.clips.index(c)+1, right)
         self.selected = right.uid
@@ -930,6 +1167,8 @@ class Editor(QMainWindow):
         self.loading = True
         self.output_resolution=settings['resolution']
         self.output_fps=int(settings['fps'])
+        self.hidden_layers=set(settings.get('hidden_layers',[]))
+        self.locked_layers=set(settings.get('locked_layers',[]))
         self.loading = False
         self.changed()
 
@@ -967,6 +1206,7 @@ class Editor(QMainWindow):
             self.clips, self.history, self.future = [], [], []
             self.selected, self.project, self.position, self.dirty = None, None, 0, False
             self.output_resolution,self.output_fps='1920x1080',60
+            self.hidden_layers,self.locked_layers=set(),set()
             self.refresh()
 
     def save(self, save_as=False):
@@ -1013,14 +1253,55 @@ class Editor(QMainWindow):
         if not self.clips or self.job:
             self.statusBar().showMessage('素材を追加してください。処理中の場合は完了をお待ちください。', 5000)
             return
-        path, _ = QFileDialog.getSaveFileName(self, 'MP4 書き出し', 'movie.mp4', 'MP4 (*.mp4)')
+        options = self.export_options_dialog()
+        if options is None:
+            return
+        ext = CODECS[options['codec']]['ext']
+        path, _ = QFileDialog.getSaveFileName(self, '書き出し', 'movie'+ext, f'{CODECS[options["codec"]]["name"]} (*{ext})')
         if path:
-            if not path.lower().endswith('.mp4'):
-                path += '.mp4'
-            if any(Path(c.path).resolve() == Path(path).resolve() for c in self.clips):
+            if not path.lower().endswith(ext):
+                path += ext
+            if any(c.path and Path(c.path).resolve() == Path(path).resolve() for c in self.clips):
                 QMessageBox.warning(self, '出力エラー', '素材と同じファイルには書き出せません。')
                 return
-            self.start_job(path)
+            self.start_job(path, options=options)
+
+    def export_options_dialog(self):
+        dialog=QDialog(self);dialog.setWindowTitle('書き出しの設定')
+        layout=QVBoxLayout(dialog);form=QFormLayout();layout.addLayout(form)
+        codec=QComboBox()
+        for key,spec in CODECS.items():codec.addItem(spec['name'],key)
+        form.addRow('形式',codec)
+        whole=QCheckBox('全体を書き出す');whole.setChecked(True);form.addRow('範囲',whole)
+        total=total_duration(self.clips)
+        start=QDoubleSpinBox();start.setRange(0,total);start.setDecimals(2);start.setSuffix(' 秒')
+        end=QDoubleSpinBox();end.setRange(0,total);end.setDecimals(2);end.setSuffix(' 秒');end.setValue(total)
+        selected=self.current()
+        range_row=QWidget();range_layout=QHBoxLayout(range_row);range_layout.setContentsMargins(0,0,0,0)
+        range_layout.addWidget(start);range_layout.addWidget(QLabel('〜'));range_layout.addWidget(end)
+        to_cursor=button('先頭〜再生位置',lambda:(start.setValue(0),end.setValue(self.position)))
+        to_clip=button('選択クリップ',lambda:(start.setValue(selected.offset),end.setValue(min(total,selected.offset+selected.duration))) if selected else None)
+        to_clip.setEnabled(selected is not None)
+        range_layout.addWidget(to_cursor);range_layout.addWidget(to_clip)
+        form.addRow('指定範囲',range_row)
+        quality=QSpinBox();quality.setRange(0,51);quality.setValue(20);quality.setToolTip('小さいほど高画質・大容量（H.264 の CRF 相当）')
+        form.addRow('画質（CRF、小さいほど高画質）',quality)
+        bitrate=QComboBox()
+        for value in (128,192,256,320):bitrate.addItem(f'{value} kbps',value)
+        bitrate.setCurrentIndex(1);form.addRow('音声ビットレート',bitrate)
+        note=QLabel(f'解像度 {self.output_resolution} / {self.output_fps} fps（「動画」→「動画の設定」で変更）。非表示レイヤーは出力されません。')
+        note.setWordWrap(True);note.setObjectName('muted');layout.addWidget(note)
+        def sync():
+            range_row.setEnabled(not whole.isChecked())
+            video=codec.currentData() not in ('wav','mp3')
+            quality.setEnabled(video);bitrate.setEnabled(codec.currentData()!='wav')
+        whole.toggled.connect(lambda *_:sync());codec.currentIndexChanged.connect(lambda *_:sync());sync()
+        buttons=QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel);buttons.accepted.connect(dialog.accept);buttons.rejected.connect(dialog.reject);layout.addWidget(buttons)
+        if dialog.exec_()!=QDialog.Accepted:return None
+        begin,finish=(0.0,None) if whole.isChecked() else (start.value(),end.value())
+        if finish is not None and finish-begin<.04:
+            QMessageBox.warning(self,'設定エラー','書き出し範囲の終了は開始より後にしてください。');return None
+        return {'codec':codec.currentData(),'start':begin,'end':finish,'crf':quality.value(),'audio_bitrate':bitrate.currentData()}
 
     def preview(self):
         if self.playback:
@@ -1035,7 +1316,7 @@ class Editor(QMainWindow):
                 return
             self.start_playback()
 
-    def start_job(self, path, preview=False):
+    def start_job(self, path, preview=False, options=None):
         if preview:
             self.preview()
             return
@@ -1044,17 +1325,22 @@ class Editor(QMainWindow):
         if self.text_timer.isActive():
             self.apply_text()
         staged = None
+        options = options or {}
         try:
-            fd, staged = tempfile.mkstemp(prefix='.lmb-', suffix='.mp4', dir=Path(path).parent)
+            ext = CODECS[options.get('codec','h264')]['ext']
+            fd, staged = tempfile.mkstemp(prefix='.lmb-', suffix=ext, dir=Path(path).parent)
             os.close(fd)
-            args = render_command(copy.deepcopy(self.clips), staged, self.output_resolution, self.output_fps, asset_dir=self.temp.name)
+            args = render_command(copy.deepcopy(self.clips), staged, self.output_resolution, self.output_fps, asset_dir=self.temp.name,
+                                  start=options.get('start',0.0), end=options.get('end'), codec=options.get('codec','h264'),
+                                  crf=options.get('crf'), audio_bitrate=options.get('audio_bitrate',192), hidden_layers=self.hidden_layers)
         except Exception as e:
             if staged:
                 Path(staged).unlink(missing_ok=True)
             QMessageBox.warning(self, '出力エラー', str(e))
             return
         process = QProcess(self)
-        self.job = {'process':process, 'path':path, 'staged':staged, 'duration':total_duration(self.clips), 'cancelled':False, 'log':'', 'buffer':''}
+        span = (options.get('end') if options.get('end') is not None else total_duration(self.clips))-options.get('start',0.0)
+        self.job = {'process':process, 'path':path, 'staged':staged, 'duration':max(.04,span), 'cancelled':False, 'log':'', 'buffer':''}
         process.readyReadStandardOutput.connect(self.job_progress)
         process.readyReadStandardError.connect(self.job_log)
         process.finished.connect(self.job_done)
@@ -1062,7 +1348,7 @@ class Editor(QMainWindow):
         self.progress.setValue(0)
         self.progress.show()
         self.cancel_button.show()
-        self.statusBar().showMessage('MP4 を書き出し中…')
+        self.statusBar().showMessage('書き出し中…')
         process.start(args[0], args[1:])
 
     def job_progress(self):
@@ -1107,7 +1393,7 @@ class Editor(QMainWindow):
                 Path(job['staged']).unlink(missing_ok=True)
                 QMessageBox.warning(self, '出力エラー', str(e))
                 return
-            self.statusBar().showMessage('MP4 の書き出しが完了しました', 5000)
+            self.statusBar().showMessage('書き出しが完了しました', 5000)
             QMessageBox.information(self, '書き出し完了', f'保存しました：\n{job["path"]}')
         else:
             Path(job['staged']).unlink(missing_ok=True)
@@ -1122,8 +1408,8 @@ class Editor(QMainWindow):
         self.frame_timer.stop()
         snapshot = copy.deepcopy(self.clips)
         try:
-            video_args = video_stream_command(snapshot, self.position, self.temp.name, hardware_decode=self.playback_hwaccel)
-            audio_args = audio_stream_command(snapshot, self.position, self.temp.name)
+            video_args = video_stream_command(snapshot, self.position, self.temp.name, hardware_decode=self.playback_hwaccel, hidden_layers=self.hidden_layers)
+            audio_args = audio_stream_command(snapshot, self.position, self.temp.name, hidden_layers=self.hidden_layers)
         except Exception as e:
             QMessageBox.warning(self, '再生エラー', str(e))
             return
@@ -1283,8 +1569,8 @@ class Editor(QMainWindow):
 
     def choose_color(self):
         c = self.current()
-        if c and c.kind == 'text':
-            color = QColorDialog.getColor(QColor(c.color), self, '文字色')
+        if c and c.kind in ('text', 'shape'):
+            color = QColorDialog.getColor(QColor(c.color), self, '文字色' if c.kind == 'text' else '図形の色')
             if color.isValid():
                 self.checkpoint()
                 c.color = color.name()
@@ -1337,6 +1623,18 @@ class Editor(QMainWindow):
                     self.paste_timeline_clips(self.position);return True
                 if event.key()==Qt.Key_D:
                     self.duplicate_timeline_clips(selected);return True
+        if event.type()==QEvent.KeyPress and event.key() in (Qt.Key_Left,Qt.Key_Right,Qt.Key_Home,Qt.Key_End) and not event.modifiers() & (Qt.ControlModifier|Qt.AltModifier):
+            from PyQt5.QtWidgets import QComboBox as _Combo, QAbstractItemView as _View
+            focus=QApplication.focusWidget()
+            window=QApplication.activeWindow()
+            ours=window is self or window in self.docks()
+            if ours and not isinstance(focus,(QLineEdit,QTextEdit,QPlainTextEdit,QAbstractSpinBox,_Combo,_View)):
+                step=1.0 if event.modifiers() & Qt.ShiftModifier else 1/self.output_fps
+                if event.key()==Qt.Key_Left:self.seek(self.position-step)
+                elif event.key()==Qt.Key_Right:self.seek(self.position+step)
+                elif event.key()==Qt.Key_Home:self.seek(0)
+                else:self.seek(total_duration(self.clips))
+                return True
         if event.type() in (QEvent.KeyPress, QEvent.KeyRelease) and event.key() == Qt.Key_Space and event.modifiers() == Qt.NoModifier:
             focus = QApplication.focusWidget()
             window = QApplication.activeWindow()
